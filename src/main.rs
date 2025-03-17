@@ -190,12 +190,13 @@ fn draw_svg(
 ) -> Result<()> {
     info!("Drawing SVG to the screen.");
     keyboard.progress_end()?;
-    let bitmap = svg_to_bitmap(svg_data, VIRTUAL_WIDTH, VIRTUAL_HEIGHT)?;
     if let Some(save_bitmap) = save_bitmap {
+        let bitmap = svg_to_bitmap(svg_data, VIRTUAL_WIDTH, VIRTUAL_HEIGHT)?;
         write_bitmap_to_file(&bitmap, save_bitmap)?;
     }
     if !no_draw {
-        pen.draw_bitmap(&bitmap)?;
+        // pen.draw_bitmap(&bitmap)?;
+        pen.draw_svg(svg_data)?;
     }
     Ok(())
 }

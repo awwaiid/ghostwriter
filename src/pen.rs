@@ -1,8 +1,9 @@
 use anyhow::Result;
 use evdev::{Device, EventType, InputEvent};
-use log::info;
+use log::{info, debug};
 use std::thread::sleep;
 use std::time::Duration;
+use svg2polylines;
 
 use crate::device::DeviceModel;
 
@@ -38,12 +39,12 @@ impl Pen {
         }
     }
 
-    pub fn draw_line_screen(&mut self, p1: (i32, i32), p2: (i32, i32)) -> Result<()> {
+    pub fn draw_line_virtual(&mut self, p1: (i32, i32), p2: (i32, i32)) -> Result<()> {
         self.draw_line(self.virtual_to_input(p1), self.virtual_to_input(p2))
     }
 
     pub fn draw_line(&mut self, (x1, y1): (i32, i32), (x2, y2): (i32, i32)) -> Result<()> {
-        // trace!("Drawing from ({}, {}) to ({}, {})", x1, y1, x2, y2);
+        // debug!("Drawing from ({}, {}) to ({}, {})", x1, y1, x2, y2);
 
         // We know this is a straight line
         // So figure out the length
@@ -54,26 +55,31 @@ impl Pen {
         let length = ((x2 as f32 - x1 as f32).powf(2.0) + (y2 as f32 - y1 as f32).powf(2.0)).sqrt();
         // 5.0 is the maximum distance between points
         // If this is too small
-        let steps = (length / 5.0).ceil() as i32;
+        // let steps = (length / 5.0).ceil() as i32;
+        let steps = length.ceil() as i32;
         let dx = (x2 - x1) / steps;
         let dy = (y2 - y1) / steps;
-        // trace!(
-        //     "Drawing from ({}, {}) to ({}, {}) in {} steps",
-        //     x1, y1, x2, y2, steps
-        // );
+        debug!(
+            "Drawing from ({}, {}) to ({}, {}) in {} steps",
+            x1, y1, x2, y2, steps
+        );
 
-        self.pen_up()?;
-        self.goto_xy((x1, y1))?;
-        self.pen_down()?;
+        // self.pen_up()?;
+        // self.goto_xy((x1, y1))?;
+        // self.pen_down()?;
 
         for i in 0..steps {
             let x = x1 + dx * i;
             let y = y1 + dy * i;
             self.goto_xy((x, y))?;
+            if i % 200 == 0 {
+                sleep(Duration::from_millis(1));
+            }
             // trace!("Drawing to point at ({}, {})", x, y);
         }
+            // sleep(Duration::from_millis(50));
 
-        self.pen_up()?;
+        // self.pen_up()?;
 
         Ok(())
     }
@@ -100,6 +106,41 @@ impl Pen {
             self.pen_up()?;
             is_pen_down = false;
             sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    pub fn draw_svg(&mut self, svg: &str) -> Result<()> {
+        // self.pen_up()?;
+        let polylines = svg2polylines::parse(svg, 0.01, true).unwrap();
+        debug!("Found {} polylines", polylines.len());
+        for polyline in polylines {
+            debug!("- {:?}", polyline);
+            let previous_point = polyline[0];
+            let mut previous_x = previous_point.x as i32;
+            let mut previous_y = previous_point.y as i32;
+
+            self.pen_up()?;
+                    sleep(Duration::from_millis(10));
+            self.goto_xy_virtual((previous_x, previous_y))?;
+            self.pen_down()?;
+                    sleep(Duration::from_millis(50));
+
+            for point in polyline {
+                debug!("Point: ({}, {})", point.x, point.y);
+                let point_x = point.x as i32;
+                let point_y = point.y as i32;
+                debug!("Drawing from ({}, {}) to ({}, {})", previous_x, previous_y, point_x, point_y);
+                if (previous_x != point_x) || (previous_y != point_y) {
+                    self.draw_line_virtual((previous_x, previous_y), (point_x, point_y))?;
+                } else {
+                    debug!("Skipping because there is no line");
+                }
+                previous_x = point_x;
+                previous_y = point_y;
+            }
+
+            self.pen_up()?;
         }
         Ok(())
     }
@@ -153,6 +194,7 @@ impl Pen {
     }
 
     pub fn goto_xy(&mut self, (x, y): (i32, i32)) -> Result<()> {
+        // debug!("Going to ({}, {})", x, y);
         if let Some(device) = &mut self.device {
             device.send_events(&[
                 InputEvent::new(EventType::ABSOLUTE, 0, x),        // ABS_X
@@ -186,8 +228,8 @@ impl Pen {
 
         match self.device_model {
             DeviceModel::RemarkablePaperPro => {
-                let x_input = (x_normalized * self.max_x_value() as f32) as i32;
-                let y_input = (y_normalized * self.max_y_value() as f32) as i32;
+                let x_input = (x_normalized * (self.max_x_value() as f32)) as i32;
+                let y_input = (y_normalized * (self.max_y_value() as f32)) as i32;
                 (x_input, y_input)
             }
             _ => {
