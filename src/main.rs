@@ -34,6 +34,11 @@ const VIRTUAL_HEIGHT: u32 = 1024;
 )]
 #[command(after_help = "See https://github.com/awwaiid/ghostwriter for updates!")]
 pub struct Args {
+    /// Sets the model to use (default: claude-sonnet-4-0)
+    #[arg(long, short)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+
     /// Sets the engine to use (openai, anthropic);
     /// Sometimes we can guess the engine from the model name
     #[arg(long)]
@@ -49,13 +54,10 @@ pub struct Args {
     #[arg(long)]
     engine_api_key: Option<String>,
 
-    /// Sets the model to use
-    #[arg(long, short, default_value = "claude-sonnet-4-0")]
-    model: String,
-
-    /// Sets the prompt to use
-    #[arg(long, default_value = "general.json")]
-    prompt: String,
+    /// Sets the prompt to use (default: general.json)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
 
     /// Do not actually submit to the model, for testing
     #[arg(short, long)]
@@ -117,17 +119,20 @@ pub struct Args {
     #[arg(long)]
     thinking: bool,
 
-    /// Set the thinking token budget (for Anthropic models)
-    #[arg(long, default_value = "5000")]
-    thinking_tokens: u32,
+    /// Set the thinking token budget (default: 5000)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_tokens: Option<u32>,
 
-    /// Set the log level. Try 'debug' or 'trace'
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Set the log level (default: info). Try 'debug' or 'trace'
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_level: Option<String>,
 
-    /// Sets which corner the touch trigger listens to (UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left)
-    #[arg(long, default_value = "UR")]
-    trigger_corner: String,
+    /// Sets which corner the touch trigger listens to (default: UR). Options: UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_corner: Option<String>,
 
     /// Save current configuration to ~/.ghostwriter.toml and exit
     #[arg(long)]
@@ -139,13 +144,25 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log_level.as_str()))
+    // Initialize logger with CLI log level first (or default to info)
+    let initial_log_level = args.log_level.as_deref().unwrap_or("info");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(initial_log_level))
         .format_timestamp_millis()
         .init();
 
+    // Load config to get the final merged settings
+    let config = Config::load(&args)?;
+
+    // Handle --save-config option
+    if args.save_config {
+        config.save()?;
+        println!("Configuration saved to {:?}", Config::config_path()?);
+        return Ok(());
+    }
+
     setup_uinput()?;
 
-    ghostwriter(&args)
+    ghostwriter(&config)
 }
 
 macro_rules! shared {
@@ -214,15 +231,7 @@ fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dy
     }
 }
 
-fn ghostwriter(args: &Args) -> Result<()> {
-    let config = Config::load(args)?;
-
-    // Handle --save-config option
-    if args.save_config {
-        config.save()?;
-        println!("Configuration saved to {:?}", Config::config_path()?);
-        return Ok(());
-    }
+fn ghostwriter(config: &Config) -> Result<()> {
 
     let trigger_corner = TriggerCorner::from_string(&config.trigger_corner)?;
     let keyboard = shared!(Keyboard::new(config.no_draw || config.no_keyboard, config.no_draw_progress,));

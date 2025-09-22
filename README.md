@@ -71,6 +71,9 @@ Draw some stuff on your screen, and then trigger the assistant by *touching/tapp
 * `--thinking` - Enable model thinking (Anthropic)
 * `--web-search` - Enable web search (Anthropic)
 
+**Configuration:**
+* `--save-config` - Save current settings to `~/.ghostwriter.toml` and exit
+
 **Testing/Debug/Experiments:**
 * `--log-level LEVEL` - Set log level (info, debug, trace)
 * `--no-loop` - Run once and exit
@@ -82,6 +85,8 @@ Draw some stuff on your screen, and then trigger the assistant by *touching/tapp
 * `--no-draw` - Don't draw output
 * `--no-trigger` - Disable touch trigger
 * `--apply-segmentation` - Add image segmentation for spatial awareness
+
+Configuration files are loaded from `~/.ghostwriter.toml` if present. Settings precedence: defaults → config file → environment variables (GHOSTWRITER_*) → CLI arguments.
 
 ### Run in the background
 

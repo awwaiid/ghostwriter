@@ -68,18 +68,13 @@ impl Config {
     /// Load configuration using figment (file -> env -> CLI precedence)
     pub fn load<T: Serialize>(args: &T) -> Result<Self> {
         let config: Self = Figment::new()
-            // Start with built-in defaults
             .merge(Serialized::defaults(Config::default()))
-            // Then layer in TOML config file (if it exists)
             .merge(Toml::file(Self::config_path()?))
-            // Then environment variables (GHOSTWRITER_MODEL, etc.)
             .merge(Env::prefixed("GHOSTWRITER_"))
-            // Finally CLI arguments (highest precedence)
             .merge(Serialized::globals(args))
             .extract()
             .map_err(|e| anyhow::anyhow!("Configuration error: {}", e))?;
 
-        // Validate the final configuration
         config.validate()?;
         Ok(config)
     }
