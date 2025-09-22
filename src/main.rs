@@ -232,7 +232,6 @@ fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dy
 }
 
 fn ghostwriter(config: &Config) -> Result<()> {
-
     let trigger_corner = TriggerCorner::from_string(&config.trigger_corner)?;
     let keyboard = shared!(Keyboard::new(config.no_draw || config.no_keyboard, config.no_draw_progress,));
     let pen = shared!(Pen::new(config.no_draw));
