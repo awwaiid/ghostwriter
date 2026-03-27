@@ -266,12 +266,12 @@ impl Screenshot {
 
     fn encode_png_move(&self, raw_data: &[u8]) -> Result<Vec<u8>> {
         // Move framebuffer is already in portrait orientation — no rotation needed
+        // Move uses standard grayscale range — skip RM2's apply_curves which crushes to binary
         let raw_u8: Vec<u8> = raw_data.chunks_exact(2).map(|chunk| u8::from_le_bytes([chunk[1]])).collect();
         let width = self.screen_width();
         let height = self.screen_height();
-        let processed: Vec<u8> = raw_u8.iter().map(|&value| Self::apply_curves(value)).collect();
 
-        let img = GrayImage::from_raw(width, height, processed).ok_or_else(|| anyhow::anyhow!("Failed to create image from raw data"))?;
+        let img = GrayImage::from_raw(width, height, raw_u8).ok_or_else(|| anyhow::anyhow!("Failed to create image from raw data"))?;
         let mut png_data = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
         encoder.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)?;
