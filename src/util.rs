@@ -91,6 +91,39 @@ pub fn setup_uinput() -> Result<()> {
         return Ok(());
     }
 
+    if device_model == DeviceModel::RemarkableMove {
+        // Check if uinput module is loaded by looking at the lsmod output
+        let output = std::process::Command::new("lsmod").output().expect("Failed to execute lsmod");
+        let output_str = std::str::from_utf8(&output.stdout).unwrap();
+        if output_str.contains("uinput") {
+            debug!("uinput module already loaded");
+            return Ok(());
+        }
+        // Try loading system module via modprobe
+        info!("Move: attempting to load system uinput module");
+        let output = std::process::Command::new("modprobe").arg("uinput").output();
+        if let Ok(result) = output {
+            if result.status.success() {
+                info!("System uinput module loaded via modprobe");
+                return Ok(());
+            }
+        }
+        // Fall back to finding and loading the module directly
+        let find_output = std::process::Command::new("find")
+            .args(&["/usr/lib/modules", "-name", "uinput.ko"])
+            .output();
+        if let Ok(result) = find_output {
+            let module_path = std::str::from_utf8(&result.stdout).unwrap().trim().to_string();
+            if !module_path.is_empty() {
+                info!("Loading uinput from: {}", module_path);
+                let _ = std::process::Command::new("insmod").arg(&module_path).output();
+                return Ok(());
+            }
+        }
+        info!("Could not load uinput module for Move - keyboard input may not work");
+        return Ok(());
+    }
+
     // Check if uinput module is loaded by looking at the lsmod output
     let output = std::process::Command::new("lsmod").output().expect("Failed to execute lsmod");
     let output_str = std::str::from_utf8(&output.stdout).unwrap();

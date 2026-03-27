@@ -4,6 +4,7 @@ use std::path::Path;
 pub enum DeviceModel {
     Remarkable2,
     RemarkablePaperPro,
+    RemarkableMove,
     Unknown,
 }
 
@@ -13,6 +14,9 @@ impl DeviceModel {
             if let Ok(hwrev) = std::fs::read_to_string("/etc/hwrevision") {
                 if hwrev.contains("ferrari 1.0") {
                     return DeviceModel::RemarkablePaperPro;
+                }
+                if hwrev.contains("chiappa 1.0") {
+                    return DeviceModel::RemarkableMove;
                 }
                 if hwrev.contains("reMarkable2 1.0") {
                     return DeviceModel::Remarkable2;
@@ -28,6 +32,7 @@ impl DeviceModel {
         match self {
             DeviceModel::Remarkable2 => "Remarkable2",
             DeviceModel::RemarkablePaperPro => "RemarkablePaperPro",
+            DeviceModel::RemarkableMove => "RemarkableMove",
             DeviceModel::Unknown => "Unknown",
         }
     }

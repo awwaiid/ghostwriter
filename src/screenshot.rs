@@ -30,6 +30,7 @@ impl Screenshot {
         match self.device_model {
             DeviceModel::Remarkable2 => 1872,
             DeviceModel::RemarkablePaperPro => 1632,
+            DeviceModel::RemarkableMove => 960,
             DeviceModel::Unknown => 1872, // Default to RM2
         }
     }
@@ -38,6 +39,7 @@ impl Screenshot {
         match self.device_model {
             DeviceModel::Remarkable2 => 1404,
             DeviceModel::RemarkablePaperPro => 2154,
+            DeviceModel::RemarkableMove => 1696,
             DeviceModel::Unknown => 1404, // Default to RM2
         }
     }
@@ -46,6 +48,7 @@ impl Screenshot {
         match self.device_model {
             DeviceModel::Remarkable2 => 2,
             DeviceModel::RemarkablePaperPro => 4,
+            DeviceModel::RemarkableMove => 2,
             DeviceModel::Unknown => 2, // Default to RM2
         }
     }
@@ -88,8 +91,8 @@ impl Screenshot {
 
     fn find_framebuffer_address(&self, pid: &str) -> Result<u64> {
         match self.device_model {
-            DeviceModel::RemarkablePaperPro => {
-                // For RMPP (arm64), we need to use the approach from pointer_arm64.go
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkableMove => {
+                // For RMPP/Move (arm64), we need to use the approach from pointer_arm64.go
                 let start_address = self.get_memory_range(pid)?;
                 let frame_pointer = self.calculate_frame_pointer(pid, start_address)?;
                 Ok(frame_pointer)
@@ -206,6 +209,7 @@ impl Screenshot {
                 )?;
             }
             _ => {
+                // RM2 and Move use grayscale
                 encoder.write_image(
                     resized_img.as_luma8().unwrap().as_raw(),
                     VIRTUAL_WIDTH,
@@ -225,7 +229,7 @@ impl Screenshot {
                 self.encode_png_rmpp(raw_data)
             }
             _ => {
-                // RM2 uses 16-bit grayscale
+                // RM2 and Move use 16-bit grayscale
                 self.encode_png_rm2(raw_data)
             }
         }
