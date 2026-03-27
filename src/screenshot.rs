@@ -267,7 +267,8 @@ impl Screenshot {
     fn encode_png_move(&self, raw_data: &[u8]) -> Result<Vec<u8>> {
         // Move framebuffer is already in portrait orientation — no rotation needed
         // Move uses standard grayscale range — skip RM2's apply_curves which crushes to binary
-        let raw_u8: Vec<u8> = raw_data.chunks_exact(2).map(|chunk| u8::from_le_bytes([chunk[1]])).collect();
+        // Move stores grayscale in the LOW byte (chunk[0]), not high byte like RM2
+        let raw_u8: Vec<u8> = raw_data.chunks_exact(2).map(|chunk| u8::from_le_bytes([chunk[0]])).collect();
         let width = self.screen_width();
         let height = self.screen_height();
 
