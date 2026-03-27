@@ -228,8 +228,12 @@ impl Screenshot {
                 // RMPP uses 32-bit RGBA format
                 self.encode_png_rmpp(raw_data)
             }
+            DeviceModel::RemarkableMove => {
+                // Move uses 16-bit grayscale, already in portrait orientation
+                self.encode_png_move(raw_data)
+            }
             _ => {
-                // RM2 and Move use 16-bit grayscale
+                // RM2 uses 16-bit grayscale, needs rotation
                 self.encode_png_rm2(raw_data)
             }
         }
@@ -256,6 +260,21 @@ impl Screenshot {
         let mut png_data = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
         encoder.write_image(final_image.as_raw(), final_image.width(), final_image.height(), image::ExtendedColorType::L8)?;
+
+        Ok(png_data)
+    }
+
+    fn encode_png_move(&self, raw_data: &[u8]) -> Result<Vec<u8>> {
+        // Move framebuffer is already in portrait orientation — no rotation needed
+        let raw_u8: Vec<u8> = raw_data.chunks_exact(2).map(|chunk| u8::from_le_bytes([chunk[1]])).collect();
+        let width = self.screen_width();
+        let height = self.screen_height();
+        let processed: Vec<u8> = raw_u8.iter().map(|&value| Self::apply_curves(value)).collect();
+
+        let img = GrayImage::from_raw(width, height, processed).ok_or_else(|| anyhow::anyhow!("Failed to create image from raw data"))?;
+        let mut png_data = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+        encoder.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)?;
 
         Ok(png_data)
     }
