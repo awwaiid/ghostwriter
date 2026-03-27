@@ -176,7 +176,7 @@ impl Touch {
         match self.device_model {
             DeviceModel::Remarkable2 => 1404,
             DeviceModel::RemarkablePaperPro => 2065,
-            DeviceModel::RemarkableMove => 2065, // Same Elan touch controller
+            DeviceModel::RemarkableMove => 1248,
             DeviceModel::Unknown => 1404, // Default to RM2
         }
     }
@@ -185,7 +185,7 @@ impl Touch {
         match self.device_model {
             DeviceModel::Remarkable2 => 1872,
             DeviceModel::RemarkablePaperPro => 2833,
-            DeviceModel::RemarkableMove => 2833, // Same Elan touch controller
+            DeviceModel::RemarkableMove => 2208,
             DeviceModel::Unknown => 1872, // Default to RM2
         }
     }
