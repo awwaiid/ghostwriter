@@ -59,7 +59,7 @@ impl Touch {
 
         let device_path = match device_model {
             DeviceModel::Remarkable2 => "/dev/input/event2",
-            DeviceModel::RemarkablePaperPro => "/dev/input/event3",
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkableMove => "/dev/input/event3",
             DeviceModel::Unknown => "/dev/input/event2", // Default to RM2
         };
 
@@ -176,6 +176,7 @@ impl Touch {
         match self.device_model {
             DeviceModel::Remarkable2 => 1404,
             DeviceModel::RemarkablePaperPro => 2065,
+            DeviceModel::RemarkableMove => 1248,
             DeviceModel::Unknown => 1404, // Default to RM2
         }
     }
@@ -184,6 +185,7 @@ impl Touch {
         match self.device_model {
             DeviceModel::Remarkable2 => 1872,
             DeviceModel::RemarkablePaperPro => 2833,
+            DeviceModel::RemarkableMove => 2208,
             DeviceModel::Unknown => 1872, // Default to RM2
         }
     }
@@ -194,7 +196,7 @@ impl Touch {
         let y_normalized = y as f32 / VIRTUAL_HEIGHT as f32;
 
         match self.device_model {
-            DeviceModel::RemarkablePaperPro => {
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkableMove => {
                 let x_input = (x_normalized * self.screen_width() as f32) as i32;
                 let y_input = (y_normalized * self.screen_height() as f32) as i32;
                 (x_input, y_input)
@@ -214,7 +216,7 @@ impl Touch {
         let y_normalized = y as f32 / self.screen_height() as f32;
 
         match self.device_model {
-            DeviceModel::RemarkablePaperPro => {
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkableMove => {
                 let x_input = (x_normalized * VIRTUAL_WIDTH as f32) as i32;
                 let y_input = (y_normalized * VIRTUAL_HEIGHT as f32) as i32;
                 (x_input, y_input)

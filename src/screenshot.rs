@@ -30,6 +30,7 @@ impl Screenshot {
         match self.device_model {
             DeviceModel::Remarkable2 => 1872,
             DeviceModel::RemarkablePaperPro => 1632,
+            DeviceModel::RemarkableMove => 960,
             DeviceModel::Unknown => 1872, // Default to RM2
         }
     }
@@ -38,6 +39,7 @@ impl Screenshot {
         match self.device_model {
             DeviceModel::Remarkable2 => 1404,
             DeviceModel::RemarkablePaperPro => 2154,
+            DeviceModel::RemarkableMove => 1696,
             DeviceModel::Unknown => 1404, // Default to RM2
         }
     }
@@ -46,6 +48,7 @@ impl Screenshot {
         match self.device_model {
             DeviceModel::Remarkable2 => 2,
             DeviceModel::RemarkablePaperPro => 4,
+            DeviceModel::RemarkableMove => 2,
             DeviceModel::Unknown => 2, // Default to RM2
         }
     }
@@ -88,8 +91,8 @@ impl Screenshot {
 
     fn find_framebuffer_address(&self, pid: &str) -> Result<u64> {
         match self.device_model {
-            DeviceModel::RemarkablePaperPro => {
-                // For RMPP (arm64), we need to use the approach from pointer_arm64.go
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkableMove => {
+                // For RMPP/Move (arm64), we need to use the approach from pointer_arm64.go
                 let start_address = self.get_memory_range(pid)?;
                 let frame_pointer = self.calculate_frame_pointer(pid, start_address)?;
                 Ok(frame_pointer)
@@ -206,6 +209,7 @@ impl Screenshot {
                 )?;
             }
             _ => {
+                // RM2 and Move use grayscale
                 encoder.write_image(
                     resized_img.as_luma8().unwrap().as_raw(),
                     VIRTUAL_WIDTH,
@@ -224,8 +228,12 @@ impl Screenshot {
                 // RMPP uses 32-bit RGBA format
                 self.encode_png_rmpp(raw_data)
             }
+            DeviceModel::RemarkableMove => {
+                // Move uses 16-bit grayscale, already in portrait orientation
+                self.encode_png_move(raw_data)
+            }
             _ => {
-                // RM2 uses 16-bit grayscale
+                // RM2 uses 16-bit grayscale, needs rotation
                 self.encode_png_rm2(raw_data)
             }
         }
@@ -252,6 +260,22 @@ impl Screenshot {
         let mut png_data = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
         encoder.write_image(final_image.as_raw(), final_image.width(), final_image.height(), image::ExtendedColorType::L8)?;
+
+        Ok(png_data)
+    }
+
+    fn encode_png_move(&self, raw_data: &[u8]) -> Result<Vec<u8>> {
+        // Move framebuffer is already in portrait orientation — no rotation needed
+        // Move uses standard grayscale range — skip RM2's apply_curves which crushes to binary
+        // Move stores grayscale in the LOW byte (chunk[0]), not high byte like RM2
+        let raw_u8: Vec<u8> = raw_data.chunks_exact(2).map(|chunk| u8::from_le_bytes([chunk[0]])).collect();
+        let width = self.screen_width();
+        let height = self.screen_height();
+
+        let img = GrayImage::from_raw(width, height, raw_u8).ok_or_else(|| anyhow::anyhow!("Failed to create image from raw data"))?;
+        let mut png_data = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+        encoder.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)?;
 
         Ok(png_data)
     }
