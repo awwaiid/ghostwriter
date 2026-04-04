@@ -173,6 +173,12 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
 fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool) -> Result<()> {
     info!("Drawing SVG to the screen.");
     keyboard.progress_end()?;
+
+    // Force the document to scroll by briefly inserting lines, then deleting them.
+    keyboard.progress("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")?;
+    sleep(Duration::from_millis(200));
+    keyboard.progress_end()?;
+
     let bitmap = svg_to_bitmap(svg_data, VIRTUAL_WIDTH, VIRTUAL_HEIGHT)?;
     if let Some(save_bitmap) = save_bitmap {
         write_bitmap_to_file(&bitmap, save_bitmap)?;
@@ -416,6 +422,9 @@ fn ghostwriter(args: &Args) -> Result<()> {
         lock!(keyboard).progress("thinking...")?;
         if engine.execute().is_err() {
             lock!(keyboard).progress(" model error. ")?;
+            // Show the error briefly, then erase progress text so it doesn't remain in the document.
+            sleep(Duration::from_millis(800));
+            lock!(keyboard).progress_end()?;
         }
 
         if config.no_loop {
