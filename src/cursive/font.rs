@@ -28,14 +28,13 @@ impl CursiveFont {
     /// `<glyph unicode="…" horiz-adv-x="…" d="…"/>` elements using only
     /// absolute M/L/C path commands).
     pub fn parse(svg_font_xml: &str) -> Result<Self> {
-        // Strip DOCTYPE to work around roxmltree's DTD rejection
-        let cleaned_xml = svg_font_xml
-            .lines()
-            .filter(|line| !line.trim().starts_with("<!DOCTYPE") && !line.trim().starts_with("<!ENTITY"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let doc = roxmltree::Document::parse(&cleaned_xml)?;
+        let doc = roxmltree::Document::parse_with_options(
+            svg_font_xml,
+            roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )?;
 
         let font_node = doc
             .descendants()
