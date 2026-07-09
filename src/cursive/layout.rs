@@ -79,6 +79,7 @@ pub fn layout(font: &CursiveFont, text: &str, placement: &Placement, config: &La
         let mut strokes: Vec<Stroke> = Vec::new();
         let mut pen_x = cursor_x;
         let mut prev_exit: Option<(f32, f32)> = None;
+        let mut prev_main_stroke_index: Option<usize> = None;
 
         for ch in raw_word.chars() {
             let Some(glyph) = font.glyphs.get(&ch) else {
@@ -110,16 +111,29 @@ pub fn layout(font: &CursiveFont, text: &str, placement: &Placement, config: &La
                 };
 
                 if can_join {
-                    if let Some(last_stroke) = strokes.last_mut() {
-                        last_stroke.extend(placed.iter().copied());
+                    if let Some(idx) = prev_main_stroke_index {
+                        strokes[idx].extend(placed.iter().copied());
+                        prev_main_stroke_index = Some(idx);
                     } else {
+                        // Defensive fallback: can_join should only be true
+                        // when there was a previous main stroke to join to,
+                        // but if that invariant is ever broken, push a new
+                        // stroke instead of panicking on an invalid index.
                         strokes.push(placed.clone());
+                        prev_main_stroke_index = Some(strokes.len() - 1);
                     }
                 } else {
                     strokes.push(placed.clone());
+                    prev_main_stroke_index = Some(strokes.len() - 1);
                 }
 
                 prev_exit = placed.last().copied();
+            } else {
+                // No main subpath at all for this glyph: nothing to join
+                // from or to, so clear join state to avoid splicing the
+                // next glyph onto an unrelated earlier stroke.
+                prev_exit = None;
+                prev_main_stroke_index = None;
             }
 
             for accent in subpath_iter {
@@ -213,6 +227,58 @@ mod tests {
         let words = layout(&font, "é", &placement, &LayoutConfig::default());
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].strokes.len(), 2, "expected main stroke + accent as separate strokes");
+    }
+
+    #[test]
+    fn accented_letter_followed_by_joining_letter_joins_the_main_stroke_not_the_accent() {
+        let font = test_font();
+        let placement = Placement {
+            x: 50.0,
+            y: 200.0,
+            max_width: 600.0,
+        };
+        // 'é' exits its main stroke at font-space y=183 (same as plain 'e'), and 't' enters
+        // at font-space y=183 too — both are in the connection zone, so 't' should join onto
+        // é's MAIN stroke, not its accent mark.
+        //
+        // Adjustment from the originally suggested test: in the embedded EMS Allure font,
+        // 't' itself has two subpaths (a main stroke plus a short separate crossbar stroke,
+        // structurally identical to how an accent is stored), so a fully-joined "ét" yields
+        // three strokes, not two: é's main stroke extended with t's main stroke, é's accent
+        // mark (untouched), and t's own crossbar (untouched). Verified via debug printing of
+        // `word.strokes.iter().map(|s| s.len())`, which showed [30, 2, 2] — the joined main
+        // stroke growing from é's 17 points to 30 (absorbing t's 13-point main stroke), while
+        // both short 2-point strokes (é's accent, t's crossbar) stayed short.
+        let eacute_main_len = font.glyphs.get(&'é').unwrap().subpaths[0].len();
+
+        let words = layout(&font, "ét", &placement, &LayoutConfig::default());
+        assert_eq!(words.len(), 1);
+        let word = &words[0];
+        assert_eq!(
+            word.strokes.len(),
+            3,
+            "expected é's main stroke (joined with t's main stroke), é's accent, and t's crossbar; got lens {:?}",
+            word.strokes.iter().map(|s| s.len()).collect::<Vec<_>>()
+        );
+
+        // The join must have landed on é's MAIN stroke: it should have grown beyond
+        // its own point count by absorbing t's main stroke.
+        assert!(
+            word.strokes[0].len() > eacute_main_len,
+            "expected é's main stroke to have absorbed t's main stroke (got {} points, é's main alone has {})",
+            word.strokes[0].len(),
+            eacute_main_len
+        );
+
+        // é's accent stroke (pushed right after its main stroke, before 't' is even
+        // processed) must stay short — it must NOT have had t's stroke data spliced
+        // onto it. é's accent subpath in the font has only 2 points.
+        let eacute_accent_len = word.strokes[1].len();
+        assert!(
+            eacute_accent_len <= 4,
+            "é's accent stroke should remain its short diacritic mark, not have 't' joined onto it (got {} points)",
+            eacute_accent_len
+        );
     }
 
     #[test]
