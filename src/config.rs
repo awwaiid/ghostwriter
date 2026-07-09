@@ -48,7 +48,7 @@ impl Default for Config {
             engine: None,
             engine_base_url: None,
             engine_api_key: None,
-            model: "claude-sonnet-4-0".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
             prompt: "general.json".to_string(),
             no_submit: false,
             no_draw: false,
