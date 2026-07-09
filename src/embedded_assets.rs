@@ -5,6 +5,10 @@ use rust_embed::Embed;
 pub struct AssetPrompts;
 
 #[derive(Embed)]
+#[folder = "fonts/"]
+pub struct AssetFonts;
+
+#[derive(Embed)]
 #[folder = "utils/"]
 #[include = "rmpp/uinput-*"]
 pub struct AssetUtils;
@@ -22,5 +26,15 @@ pub fn load_config(filename: &str) -> String {
         std::fs::read_to_string(filename).unwrap()
     } else {
         std::str::from_utf8(AssetPrompts::get(filename).unwrap().data.as_ref()).unwrap().to_string()
+    }
+}
+
+pub fn load_font_asset(filename: &str) -> String {
+    log::debug!("Loading font asset {}", filename);
+
+    if std::path::Path::new(filename).exists() {
+        std::fs::read_to_string(filename).unwrap()
+    } else {
+        std::str::from_utf8(AssetFonts::get(filename).unwrap().data.as_ref()).unwrap().to_string()
     }
 }

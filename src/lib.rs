@@ -2,6 +2,7 @@ pub mod cancellation;
 pub mod skeleton;
 pub mod config;
 pub mod coordinator;
+pub mod cursive;
 pub mod device;
 pub mod embedded_assets;
 pub mod keyboard;

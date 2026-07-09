@@ -936,6 +936,7 @@ dependencies = [
  "log",
  "reqwest",
  "resvg",
+ "roxmltree 0.20.0",
  "rust-embed",
  "serde",
  "serde_json",

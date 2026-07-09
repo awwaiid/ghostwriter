@@ -20,6 +20,7 @@ clap = { version = "4.0", features = ["derive"] }
 evdev = { version = "0.13", features = ["tokio"] }
 resvg = "0.47"
 svg2polylines = "0.8"
+roxmltree = "0.20"
 dotenv = "0.15"
 imageproc = "0.25.0"
 rust-embed = { version = "8.5.0", features = ["include-exclude", "compression"] }
