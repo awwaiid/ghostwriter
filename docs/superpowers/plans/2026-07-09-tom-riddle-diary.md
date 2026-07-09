@@ -2,6 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Progress (as of 2026-07-09, branch `tom-riddle-diary`)
+
+Executed via superpowers:subagent-driven-development, one implementer + task-reviewer subagent pair per task, in git worktree `.claude/worktrees/tom-riddle-diary`.
+
+- [x] **Task 0** — dev environment (Rust toolchain, `cross`, armv7 target) installed on the host; SSH access to the tablet deliberately deferred to Task 8's on-device spike (not needed until then).
+- [x] **Task 1** — cursive module scaffold + vendored EMS Allure font. Review initially raised a Critical concern that some glyphs looked hand-fabricated; independently disproved by diffing against a fresh, unrelated upstream mirror (byte-identical) — false positive, retracted.
+- [x] **Task 2** — SVG font parser. Fixed a latent bug in the plan's own given code (roxmltree rejects the font's DOCTYPE by default; switched to its native `allow_dtd` option instead of a fragile hand-rolled line filter).
+- [x] **Task 3** — œ/Œ text normalization. Clean, no findings.
+- [x] **Task 4** — layout + letter joining. Implementer found and fixed 3 real bugs in the plan's given code (a scale-factor algebra error in the join check; `CONNECTION_ZONE_HALF_WIDTH` too narrow for real font geometry, widened 80→165 with measured justification; word-dropping for all-unsupported-character tokens). Review caught a further real bug: joins were splicing onto an accent stroke instead of the letter's main stroke after accented letters — fixed with index-based tracking and a regression test, directly relevant since French accents are central to this feature.
+- [x] **Task 5** — humanizer (seeded noise). Clean; reviewer independently verified the PRNG math and amplitude claims against the real font.
+- [ ] **Task 6** — pen primitive, animator, debug renderer, `write_cursive` API. Implementation and its own tests are done and reviewer-approved (commit `e02e8c9`), but the reviewer's golden-PNG inspection surfaced a real, Important-severity visual defect inherited from Task 4's `CONNECTION_ZONE_HALF_WIDTH = 165.0`: the join check only compares glyph exit/entry *height*, never the actual distance between the two points, so visually-unrelated glyphs that happen to share a height band get spliced together — producing hard straight-line artifacts across "Bonjour", "m'appelle", and "étais" in the golden sentence. **A fix (adding a max join-distance constraint, calibrated against real measured gaps) was in progress when work paused to push this branch for visibility — this is the next thing to finish before Task 6 is fully closed.**
+- [ ] Tasks 7–11 not yet started.
+
+Full task-by-task detail (findings, fixes, reviewer verdicts) is in `.superpowers/sdd/progress.md`, which is gitignored (local scratch, not pushed) — this summary is the durable record.
+
 **Goal:** Make the reMarkable 2 answer handwritten questions in animated, connected cursive handwriting — triggered by a spiral gesture drawn anywhere on the device — reproducing the Tom Riddle diary effect from *Harry Potter*.
 
 **Architecture:** A new `src/cursive/` module turns plain LLM-returned text into humanized, connected single-line cursive stroke geometry (parsed from a bundled SIL-OFL SVG font), which is drawn through a new `Pen::draw_stroke_virtual` primitive. A new `src/gesture.rs` watches the pen input device for a spiral stroke as a second trigger source alongside the existing corner tap. A new `src/notebook.rs` detects the currently open xochitl document to select between a neutral prompt and a Tom Jedusor persona prompt for a designated diary notebook. Everything runs on-device; the only network calls remain the existing LLM API calls.
