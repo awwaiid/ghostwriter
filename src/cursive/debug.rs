@@ -55,6 +55,6 @@ mod tests {
         assert!(out_path.exists());
         let metadata = std::fs::metadata(&out_path).unwrap();
         assert!(metadata.len() > 0);
-        // let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&out_path);
     }
 }
