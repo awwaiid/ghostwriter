@@ -2,3 +2,4 @@
 //! connected single-line cursive strokes drawn by the pen.
 
 pub mod font;
+pub mod text;
