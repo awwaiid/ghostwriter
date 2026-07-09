@@ -560,31 +560,40 @@ impl Pen {
         self.draw_polylines(&polylines)
     }
 
-    /// Draw paths given as lists of (x, y) virtual coordinates.
-    /// No corner detection — skeleton paths are already single-pixel-wide and smooth.
-    fn draw_virtual_paths(&mut self, paths: &[Vec<(f32, f32)>]) -> Result<()> {
+    /// Draw a single continuous stroke from a list of virtual-space points:
+    /// pen down at the first point, interpolated moves through the rest,
+    /// pen up at the end. Used by the cursive handwriting renderer, which
+    /// already computes one stroke per pen-down run (letters are pre-joined
+    /// at layout time), so no corner detection is needed here.
+    pub fn draw_stroke_virtual(&mut self, points: &[(f32, f32)]) -> Result<()> {
+        if points.len() < 2 {
+            return Ok(());
+        }
         const MAX_STEP: f32 = 1.0;
         let mut step_count = 0usize;
 
+        let start = self.virtual_to_input((points[0].0 as i32, points[0].1 as i32));
+        self.pen_up()?;
+        sleep(Duration::from_millis(2));
+        self.pen_down_at(start)?;
+        sleep(Duration::from_millis(2));
+
+        let mut prev = points[0];
+        for &pt in &points[1..] {
+            self.draw_segment(prev, pt, &mut step_count, MAX_STEP)?;
+            prev = pt;
+        }
+
+        self.pen_up()?;
+        sleep(Duration::from_millis(2));
+        Ok(())
+    }
+
+    /// Draw paths given as lists of (x, y) virtual coordinates.
+    /// No corner detection — skeleton paths are already single-pixel-wide and smooth.
+    fn draw_virtual_paths(&mut self, paths: &[Vec<(f32, f32)>]) -> Result<()> {
         for path in paths {
-            if path.len() < 2 {
-                continue;
-            }
-
-            let start = self.virtual_to_input((path[0].0 as i32, path[0].1 as i32));
-            self.pen_up()?;
-            sleep(Duration::from_millis(2));
-            self.pen_down_at(start)?;
-            sleep(Duration::from_millis(2));
-
-            let mut prev = path[0];
-            for &pt in &path[1..] {
-                self.draw_segment(prev, pt, &mut step_count, MAX_STEP)?;
-                prev = pt;
-            }
-
-            self.pen_up()?;
-            sleep(Duration::from_millis(2));
+            self.draw_stroke_virtual(path)?;
         }
         Ok(())
     }
