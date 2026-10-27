@@ -340,7 +340,12 @@ impl Screenshot {
         if bpp == 4 {
             // Firmware 3.24+: data is stored portrait (1404×1872), 32-bit BGRA.
             // Values are already full 8-bit range — don't apply the old aggressive curve.
-            let processed: Vec<u8> = raw_data.chunks_exact(4).map(|chunk| chunk[0]).collect();
+            // Convert with Rec. 601 luma rather than taking one channel: coloured ink (e.g. blue)
+            // is near-white in its own channel and would vanish from the screenshot.
+            let processed: Vec<u8> = raw_data
+                .chunks_exact(4)
+                .map(|chunk| ((chunk[2] as u32 * 299 + chunk[1] as u32 * 587 + chunk[0] as u32 * 114) / 1000) as u8)
+                .collect();
             let img = GrayImage::from_raw(1404, 1872, processed).ok_or_else(|| anyhow::anyhow!("Failed to create image from raw data"))?;
             encoder.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)?;
         } else {
