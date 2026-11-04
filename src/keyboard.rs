@@ -6,6 +6,46 @@ use std::{thread, time};
 
 use evdev::{uinput::VirtualDevice, AttributeSet, EventType as EvdevEventType, InputEvent, KeyCode as EvdevKey};
 
+/// The virtual keyboard uses the US layout and has no dead keys, so accented and
+/// typographic characters are replaced by the closest ASCII text before typing.
+fn fold_char(c: char) -> String {
+    let s = match c {
+        'à' | 'â' | 'ä' | 'á' => "a",
+        'À' | 'Â' | 'Ä' | 'Á' => "A",
+        'é' | 'è' | 'ê' | 'ë' => "e",
+        'É' | 'È' | 'Ê' | 'Ë' => "E",
+        'î' | 'ï' | 'í' => "i",
+        'Î' | 'Ï' => "I",
+        'ô' | 'ö' | 'ó' => "o",
+        'Ô' | 'Ö' => "O",
+        'ù' | 'û' | 'ü' | 'ú' => "u",
+        'Ù' | 'Û' | 'Ü' => "U",
+        'ç' => "c",
+        'Ç' => "C",
+        'ñ' => "n",
+        'œ' => "oe",
+        'Œ' => "OE",
+        'æ' => "ae",
+        '’' | '‘' => "'",
+        '«' | '»' | '“' | '”' => "\"",
+        '–' | '—' | '−' => "-",
+        '…' => "...",
+        '×' => "x",
+        '²' => "^2",
+        '³' => "^3",
+        '÷' => "/",
+        '≈' => "~",
+        '≤' => "<=",
+        '≥' => ">=",
+        '≠' => "!=",
+        '→' => "->",
+        '°' => " deg",
+        '\u{a0}' | '\u{202f}' => " ",
+        _ => return c.to_string(),
+    };
+    s.to_string()
+}
+
 pub struct Keyboard {
     device: Option<VirtualDevice>,
     key_map: HashMap<char, (EvdevKey, bool)>,
@@ -242,7 +282,8 @@ impl Keyboard {
             device.emit(&[InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0)])?;
             thread::sleep(time::Duration::from_millis(10));
 
-            for c in input.chars() {
+            let folded: String = input.chars().map(fold_char).collect();
+            for c in folded.chars() {
                 if let Some(&(key, shift)) = self.key_map.get(&c) {
                     if shift {
                         // Press Shift

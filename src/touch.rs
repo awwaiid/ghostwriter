@@ -410,6 +410,40 @@ impl Touch {
         Ok(())
     }
 
+    /// Paper Pro, firmware 3.30: typed keys only show while the page's text block is
+    /// being edited. Tapping the Text tool opens a menu whose first entry,
+    /// "Modifier le texte" / "Edit text", puts the cursor at the end of that block.
+    const TEXT_EDIT_BUTTON: (i32, i32) = (143, 186);
+    /// "Hide keyboard" icon at the right of the on-screen keyboard toolbar; it leaves
+    /// text editing and gives the pen back.
+    const HIDE_KEYBOARD_BUTTON: (i32, i32) = (730, 748);
+
+    /// Enter text editing so the virtual keyboard can type. Returns whether the
+    /// palette was open, for `close_text_edit`.
+    pub async fn open_text_edit(&mut self) -> Result<bool> {
+        let (palette_open, _) = self.read_tool_state().await;
+        if !palette_open {
+            self.tap(Self::PALETTE_BUTTON).await?;
+            sleep(Duration::from_millis(100)).await;
+        }
+        self.tap((Self::SIDEBAR_X, Self::SIDEBAR_Y_TEXT)).await?;
+        self.tap(Self::TEXT_EDIT_BUTTON).await?;
+        sleep(Duration::from_millis(1000)).await;
+        info!("open_text_edit: done, palette_was_open={}", palette_open);
+        Ok(palette_open)
+    }
+
+    /// Leave text editing and put the palette back as it was.
+    pub async fn close_text_edit(&mut self, palette_was_open: bool) -> Result<()> {
+        self.tap(Self::HIDE_KEYBOARD_BUTTON).await?;
+        sleep(Duration::from_millis(800)).await;
+        if !palette_was_open {
+            self.tap(Self::PALETTE_BUTTON).await?;
+        }
+        info!("close_text_edit: done");
+        Ok(())
+    }
+
     /// Select fineliner pen with correct tip type, medium size, and black color.
     ///
     /// Robust algorithm that does not rely on knowing the current state:
