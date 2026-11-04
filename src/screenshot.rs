@@ -177,8 +177,14 @@ impl Screenshot {
             DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
                 // For RMPP (arm64), we need to use the approach from pointer_arm64.go
                 let start_address = self.get_memory_range(pid)?;
-                let frame_pointer = self.calculate_frame_pointer(pid, start_address)?;
-                Ok(frame_pointer)
+                match self.calculate_frame_pointer(pid, start_address) {
+                    Ok(frame_pointer) => Ok(frame_pointer),
+                    Err(e) => {
+                        // Firmware 3.30+: the walk after /dev/dri/card0 no longer reaches the screen buffer.
+                        info!("Header walk failed ({e}), scanning anonymous mappings for the screen buffer");
+                        self.scan_for_screen_buffer(pid)
+                    }
+                }
             }
             _ => {
                 // RM2: find the mapping after /dev/fb0 in /proc/pid/maps, then apply firmware offset.
@@ -198,6 +204,69 @@ impl Screenshot {
                 );
                 Ok(address + pointer_offset + 8)
             }
+        }
+    }
+
+    // Firmware 3.30 (Paper Pro): the BGRA screen buffer is a glibc mmapped chunk
+    // slightly larger than width*height*4, somewhere in xochitl's anonymous mappings
+    // (not always at the start of a mapping, since the kernel merges adjacent ones).
+    // Find every 16-aligned malloc header whose size fits, then keep the candidate
+    // whose bytes are almost all 0x00/0xFF (black/white page pixels): another buffer
+    // of similar size holds a garbled composite.
+    fn scan_for_screen_buffer(&self, pid: &str) -> Result<u64> {
+        let screen_size = self.screen_width() as u64 * self.screen_height() as u64 * self.bytes_per_pixel() as u64;
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid))?;
+        let mut mem = File::open(format!("/proc/{}/mem", pid))?;
+        let mut candidates = Vec::new();
+
+        for line in maps.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 || !fields[1].starts_with("rw") || (fields.len() >= 6 && fields[5] != "[heap]") {
+                continue;
+            }
+            let Some((a, b)) = fields[0].split_once('-') else { continue };
+            let (start, end) = (u64::from_str_radix(a, 16)?, u64::from_str_radix(b, 16)?);
+
+            let block = 4u64 << 20;
+            let mut buf = vec![0u8; block as usize];
+            let mut off = start;
+            while off < end {
+                let len = block.min(end - off) as usize;
+                if mem.seek(std::io::SeekFrom::Start(off)).is_ok() && mem.read_exact(&mut buf[..len]).is_ok() {
+                    let mut i = 8;
+                    while i + 8 <= len {
+                        let size = u64::from_le_bytes(buf[i..i + 8].try_into()?) & !7;
+                        if size >= screen_size + 16 && size <= screen_size + 65536 {
+                            candidates.push(off + i as u64 + 8);
+                        }
+                        i += 16;
+                    }
+                }
+                off += block;
+            }
+        }
+
+        let mut best: Option<(u64, f64)> = None;
+        let mut data = vec![0u8; screen_size as usize];
+        for address in candidates {
+            if mem.seek(std::io::SeekFrom::Start(address)).is_err() || mem.read_exact(&mut data).is_err() {
+                continue;
+            }
+            let sampled = data.iter().step_by(16);
+            let total = (data.len() / 16) as f64;
+            let bw = sampled.filter(|&&v| v == 0 || v == 255).count() as f64 / total;
+            debug!("screen buffer candidate {:#x} black/white={:.3}", address, bw);
+            if bw > 0.9 && best.is_none_or(|(_, s)| bw > s) {
+                best = Some((address, bw));
+            }
+        }
+
+        match best {
+            Some((address, score)) => {
+                info!("Screen buffer found at {:#x} (black/white ratio {:.2})", address, score);
+                Ok(address)
+            }
+            None => anyhow::bail!("No screen buffer candidate found in xochitl memory"),
         }
     }
 

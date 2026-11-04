@@ -195,6 +195,8 @@ macro_rules! lock {
 fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     info!("Drawing text to the screen.");
     keyboard.progress_end()?;
+    // Start on a new line: on the Paper Pro the cursor sits at the end of the page's text.
+    keyboard.string_to_keypresses("\n")?;
     keyboard.key_cmd_body()?;
     keyboard.string_to_keypresses(text)?;
     Ok(())
@@ -386,11 +388,13 @@ async fn run_ghostwriter_loop(
 
     // Give keyboard time to initialize
     // sleep(Duration::from_millis(1000)).await;
-    touch.write().await.tap_middle_bottom().await?;
-    // sleep(Duration::from_millis(1000)).await;
-    lock!(keyboard).progress("Ghostwriter starting...")?;
-    sleep(Duration::from_millis(1000)).await;
-    lock!(keyboard).progress_end()?;
+    // Paper Pro: skip the startup message, it would type into the page's text block.
+    if ghostwriter::device::DeviceModel::detect() != ghostwriter::device::DeviceModel::RemarkablePaperPro {
+        touch.write().await.tap_middle_bottom().await?;
+        lock!(keyboard).progress("Ghostwriter starting...")?;
+        sleep(Duration::from_millis(1000)).await;
+        lock!(keyboard).progress_end()?;
+    }
 
     // Initialize engine
     let mut engine_options = OptionMap::new();

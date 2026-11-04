@@ -7,13 +7,14 @@ use tokio::time::{sleep, Duration};
 
 use crate::cancellation::GhostwriterCancellation;
 use crate::config::Config;
+use crate::device::DeviceModel;
 use crate::embedded_assets::load_config;
 use crate::keyboard::Keyboard;
 use crate::llm_engine::{LLMEngine, ModelExecutionStatus};
 use crate::screenshot::Screenshot;
 use crate::segmenter::ImageAnalyzer;
 use crate::simulation::SimulationConfig;
-use crate::touch::Touch;
+use crate::touch::{Touch, TriggerCorner};
 
 /// Events that can trigger AI processing
 #[derive(Debug, Clone)]
@@ -315,8 +316,17 @@ pub async fn processing_task(
         return Ok(());
     }
 
-    // Tap middle bottom to position cursor for text input (before showing "Thinking")
-    if let Err(e) = touch.write().await.tap_middle_bottom().await {
+    // Position the cursor for text input (before showing "Thinking").
+    // Paper Pro: open the page's text block through the Text tool, closed again below.
+    let paper_pro = !config.no_draw && !config.is_test_mode() && DeviceModel::detect() == DeviceModel::RemarkablePaperPro;
+    let mut text_edit_palette: Option<bool> = None;
+    // A fresh Touch: the trigger task takes the shared one again while we wait for the LLM.
+    if paper_pro {
+        match Touch::new(false, TriggerCorner::UpperRight).open_text_edit().await {
+            Ok(palette_was_open) => text_edit_palette = Some(palette_was_open),
+            Err(e) => info!("Failed to open text editing: {}", e),
+        }
+    } else if let Err(e) = touch.write().await.tap_middle_bottom().await {
         info!("Failed to tap middle bottom: {}", e);
     }
 
@@ -378,6 +388,13 @@ pub async fn processing_task(
     // Execute LLM with proper error handling
     info!("Processing task: calling LLM");
     let execution_result = engine_guard.execute(&cancellation, status_callback).await;
+
+    if let Some(palette_was_open) = text_edit_palette {
+        sleep(Duration::from_millis(300)).await;
+        if let Err(e) = Touch::new(false, TriggerCorner::UpperRight).close_text_edit(palette_was_open).await {
+            info!("Failed to close text editing: {}", e);
+        }
+    }
 
     // Write model output if configured
     if let Some(model_output_file) = &config.model_output_file {
