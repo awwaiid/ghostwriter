@@ -2,7 +2,7 @@ name: Code Quality
 
 on:
   push:
-    branches: [ main, clean-up ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
 
@@ -27,7 +27,7 @@ jobs:
         with:
           components: clippy
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   check:
     name: Check Compilation

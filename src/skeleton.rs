@@ -50,6 +50,9 @@ pub fn thin_zhang_suen(grid: &mut [Vec<bool>]) {
                     }
 
                     let (p2, p4, p6, p8) = (p[0], p[2], p[4], p[6]);
+                    // Written to match the Zhang-Suen paper's conditions
+                    // (P2*P4*P6 = 0 and P4*P6*P8 = 0) rather than clippy's minimized form.
+                    #[allow(clippy::nonminimal_bool)]
                     let remove = if pass == 0 {
                         (!p2 || !p4 || !p6) && (!p4 || !p6 || !p8)
                     } else {
