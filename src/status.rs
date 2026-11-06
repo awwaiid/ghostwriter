@@ -21,7 +21,7 @@ impl Default for GhostwriterStatus {
             error: None,
             uptime_seconds: 0,
             executions_count: 0,
-            current_model: "claude-sonnet-4-0".to_string(),
+            current_model: "claude-sonnet-4-6".to_string(),
             current_prompt: "general.json".to_string(),
         }
     }

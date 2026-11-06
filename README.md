@@ -44,7 +44,7 @@ chmod +x ./ghostwriter
 
 First you need to start `ghostwriter` on the reMarkable. SSH into your remarkable and run:
 ```
-# Use the defaults, including claude-sonnet-4-0
+# Use the defaults, including claude-sonnet-4-6
 ./ghostwriter
 
 # Use ChatGPT with the gpt-4o-mini model
@@ -56,7 +56,7 @@ Draw some stuff on your screen, and then trigger the assistant by *touching/tapp
 ### CLI Options
 
 **Models & Engines:**
-* `--model MODEL` - Model to use (default: claude-sonnet-4-0)
+* `--model MODEL` - Model to use (default: claude-sonnet-4-6)
 * `--engine ENGINE` - Engine: openai, anthropic, google (auto-detected from model)
 * `--engine-api-key KEY` - API key (or use env vars)
 * `--engine-base-url URL` - Custom API base URL
@@ -82,6 +82,14 @@ Draw some stuff on your screen, and then trigger the assistant by *touching/tapp
 * `--no-draw` - Don't draw output
 * `--no-trigger` - Disable touch trigger
 * `--apply-segmentation` - Add image segmentation for spatial awareness
+
+### Configuration file and environment
+
+Every setting above can also go in `~/.ghostwriter.toml` (using the option name with underscores, like `model = "gpt-4o-mini"` or `trigger_corner = "UL"`) or in a `GHOSTWRITER_` environment variable (like `GHOSTWRITER_MODEL=gpt-4o-mini`).
+
+Later sources override earlier ones: built-in defaults → `~/.ghostwriter.toml` → `GHOSTWRITER_*` environment variables → command-line flags. Command-line flags only override when you actually pass them.
+
+* `--save-config` - Write the current combined settings to `~/.ghostwriter.toml` and exit
 
 ### Run in the background
 
