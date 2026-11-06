@@ -29,9 +29,6 @@ figment = { version = "0.10", features = ["toml", "env"] }
 toml = "0.8"
 warp = "0.3"
 
-[dev-dependencies]
-clippy = "0.0.302"
-
 [lib]
 name = "ghostwriter"
 path = "src/lib.rs"
