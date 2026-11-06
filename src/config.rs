@@ -48,7 +48,7 @@ impl Default for Config {
             engine: None,
             engine_base_url: None,
             engine_api_key: None,
-            model: "claude-sonnet-4-0".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             prompt: "general.json".to_string(),
             no_submit: false,
             no_draw: false,
@@ -82,11 +82,16 @@ impl Default for Config {
 impl Config {
     /// Load configuration using figment (file -> env -> CLI precedence)
     pub fn load<T: Serialize>(args: &T) -> Result<Self> {
+        Self::load_from(args, &Self::config_path()?)
+    }
+
+    /// Like `load`, but reading the TOML config from `config_path`
+    pub fn load_from<T: Serialize>(args: &T, config_path: &std::path::Path) -> Result<Self> {
         let config: Self = Figment::new()
             // Start with built-in defaults
             .merge(Serialized::defaults(Config::default()))
             // Then layer in TOML config file (if it exists)
-            .merge(Toml::file(Self::config_path()?))
+            .merge(Toml::file(config_path))
             // Then environment variables (GHOSTWRITER_MODEL, etc.)
             .merge(Env::prefixed("GHOSTWRITER_"))
             // Finally CLI arguments (highest precedence)
