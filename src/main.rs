@@ -29,6 +29,12 @@ use ghostwriter::{
 const VIRTUAL_WIDTH: u32 = 768;
 const VIRTUAL_HEIGHT: u32 = 1024;
 
+/// Command-line arguments.
+///
+/// These are layered on top of defaults, ~/.ghostwriter.toml, and GHOSTWRITER_*
+/// environment variables (see `Config::load`). Only flags actually passed on the
+/// command line should override those, so unset options and `false` switches are
+/// skipped during serialization; defaults live in `Config::default()`.
 #[derive(Parser, Serialize)]
 #[command(author, version)]
 #[command(about = "Vision-LLM Agent for the reMarkable2")]
@@ -40,129 +46,165 @@ pub struct Args {
     /// Sets the engine to use (openai, anthropic);
     /// Sometimes we can guess the engine from the model name
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     engine: Option<String>,
 
     /// Sets the base URL for the engine API;
     /// Or use environment variable OPENAI_BASE_URL or ANTHROPIC_BASE_URL
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     engine_base_url: Option<String>,
 
     /// Sets the API key for the engine;
     /// Or use environment variable OPENAI_API_KEY or ANTHROPIC_API_KEY
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     engine_api_key: Option<String>,
 
-    /// Sets the model to use
-    #[arg(long, short, default_value = "claude-sonnet-4-6")]
-    model: String,
+    /// Sets the model to use (default: claude-sonnet-4-6)
+    #[arg(long, short)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 
-    /// Sets the prompt to use
-    #[arg(long, default_value = "general.json")]
-    prompt: String,
+    /// Sets the prompt to use (default: general.json)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
 
     /// Do not actually submit to the model, for testing
     #[arg(short, long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_submit: bool,
 
     /// Skip running draw_text or draw_svg, for testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_draw: bool,
 
     /// Disable SVG drawing tool
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_svg: bool,
 
     /// Disable keyboard
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_keyboard: bool,
 
     /// Disable keyboard progress
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_draw_progress: bool,
 
     /// Input PNG file for testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_png: Option<String>,
 
     /// Output file for testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     output_file: Option<String>,
 
     /// Output file for model parameters
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     model_output_file: Option<String>,
 
     /// Save screenshot filename
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     save_screenshot: Option<String>,
 
     /// Save bitmap filename
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     save_bitmap: Option<String>,
 
     /// Disable looping
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_loop: bool,
 
     /// Disable waiting for trigger
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_trigger: bool,
 
     /// Apply segmentation
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     apply_segmentation: bool,
 
     /// Enable web search (for Anthropic models)
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     web_search: bool,
 
     /// Enable model thinking (for Anthropic models)
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     thinking: bool,
 
-    /// Set the thinking token budget (for Anthropic models)
-    #[arg(long, default_value = "5000")]
-    thinking_tokens: u32,
+    /// Set the thinking token budget (for Anthropic models; default: 5000)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_tokens: Option<u32>,
 
-    /// Set the log level. Try 'debug' or 'trace'
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Set the log level (default: info). Try 'debug' or 'trace'
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_level: Option<String>,
 
-    /// Sets which corner the touch trigger listens to (UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left)
-    #[arg(long, default_value = "UR")]
-    trigger_corner: String,
+    /// Sets which corner the touch trigger listens to (default: UR).
+    /// Options: UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_corner: Option<String>,
 
     /// Save current configuration to ~/.ghostwriter.toml and exit
     #[arg(long)]
+    #[serde(skip)]
     save_config: bool,
 
     /// Start web server for configuration UI
     #[arg(long)]
+    #[serde(skip)]
     web_server: bool,
 
     /// Port for web server (default: 8080)
     #[arg(long, default_value = "8080")]
+    #[serde(skip)]
     web_port: u16,
 
     /// Enable test/simulation mode for specific device (rm2, rmpp)
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_mode: Option<String>,
 
     /// File containing scripted touch events for simulation (JSON format)
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_touch_events_file: Option<String>,
 
     /// Directory containing test screenshots to cycle through
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_screenshot_dir: Option<String>,
 
     /// Auto-trigger delay in seconds for automated testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_auto_trigger_delay: Option<u32>,
 
     /// File to log simulated interactions to
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_interaction_log: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[tokio::main]
@@ -171,13 +213,24 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log_level.as_str()))
+    // Load config before starting the logger so log_level can come from the
+    // config file or environment, not just the CLI
+    let config = Config::load(&args)?;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(config.log_level.as_str()))
         .format_timestamp_millis()
         .init();
 
+    // Handle --save-config option (before touching any devices)
+    if args.save_config {
+        config.save()?;
+        println!("Configuration saved to {:?}", Config::config_path()?);
+        return Ok(());
+    }
+
     setup_uinput()?;
 
-    ghostwriter(&args).await
+    ghostwriter(&args, config).await
 }
 
 macro_rules! shared {
@@ -247,21 +300,12 @@ fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dy
     }
 }
 
-async fn ghostwriter(args: &Args) -> Result<()> {
-    let mut config = Config::load(args)?;
-
+async fn ghostwriter(args: &Args, mut config: Config) -> Result<()> {
     // Parse test_mode device model if provided
     if let Some(device_str) = &config.test_mode {
         let device_model = DeviceModel::from_string(device_str)?;
         config.test_device_model = Some(device_model);
         info!("Test mode enabled for device: {}", device_model.name());
-    }
-
-    // Handle --save-config option
-    if args.save_config {
-        config.save()?;
-        println!("Configuration saved to {:?}", Config::config_path()?);
-        return Ok(());
     }
 
     // Create shared state for live config updates
@@ -657,4 +701,92 @@ fn register_tools(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A config file path unique to this test, removed on drop
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new(name: &str, contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("ghostwriter-test-{}-{}.toml", std::process::id(), name));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const FILE_CONFIG: &str = r#"
+        model = "model-from-file"
+        prompt = "prompt-from-file.json"
+        thinking_tokens = 1234
+        log_level = "debug"
+        trigger_corner = "LL"
+        engine = "openai"
+        no_draw = true
+        no_svg = true
+    "#;
+
+    #[test]
+    fn config_file_wins_over_unset_cli_args() {
+        let file = TempConfig::new("file-wins", FILE_CONFIG);
+        let args = Args::parse_from(["ghostwriter"]);
+        let config = Config::load_from(&args, &file.0).unwrap();
+
+        assert_eq!(config.model, "model-from-file");
+        assert_eq!(config.prompt, "prompt-from-file.json");
+        assert_eq!(config.thinking_tokens, 1234);
+        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.trigger_corner, "LL");
+        assert_eq!(config.engine.as_deref(), Some("openai"));
+        assert!(config.no_draw);
+        assert!(config.no_svg);
+    }
+
+    #[test]
+    fn explicit_cli_args_win_over_config_file() {
+        let file = TempConfig::new("cli-wins", FILE_CONFIG);
+        let args = Args::parse_from([
+            "ghostwriter",
+            "--model",
+            "model-from-cli",
+            "--trigger-corner",
+            "UL",
+            "--thinking-tokens",
+            "42",
+            "--no-keyboard",
+        ]);
+        let config = Config::load_from(&args, &file.0).unwrap();
+
+        assert_eq!(config.model, "model-from-cli");
+        assert_eq!(config.trigger_corner, "UL");
+        assert_eq!(config.thinking_tokens, 42);
+        assert!(config.no_keyboard);
+        // Not passed on the CLI, so still from the file
+        assert_eq!(config.prompt, "prompt-from-file.json");
+        assert!(config.no_draw);
+    }
+
+    #[test]
+    fn defaults_apply_without_config_file() {
+        let args = Args::parse_from(["ghostwriter"]);
+        let missing = std::env::temp_dir().join(format!("ghostwriter-test-{}-missing.toml", std::process::id()));
+        let config = Config::load_from(&args, &missing).unwrap();
+
+        let defaults = Config::default();
+        assert_eq!(config.model, defaults.model);
+        assert_eq!(config.prompt, "general.json");
+        assert_eq!(config.thinking_tokens, 5000);
+        assert_eq!(config.trigger_corner, "UR");
+        assert!(!config.no_draw);
+    }
 }
