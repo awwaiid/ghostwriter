@@ -13,7 +13,7 @@ use ghostwriter::{
     cancellation::GhostwriterCancellation,
     config::Config,
     coordinator::{self, CoordinatorChannels, ProgressState},
-    device::DeviceModel,
+    device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
     embedded_assets::load_config,
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
@@ -25,10 +25,6 @@ use ghostwriter::{
     web_server::start_web_server,
 };
 
-// Output dimensions remain the same for both devices
-const VIRTUAL_WIDTH: u32 = 768;
-const VIRTUAL_HEIGHT: u32 = 1024;
-
 /// Command-line arguments.
 ///
 /// These are layered on top of defaults, ~/.ghostwriter.toml, and GHOSTWRITER_*
@@ -37,26 +33,26 @@ const VIRTUAL_HEIGHT: u32 = 1024;
 /// skipped during serialization; defaults live in `Config::default()`.
 #[derive(Parser, Serialize)]
 #[command(author, version)]
-#[command(about = "Vision-LLM Agent for the reMarkable2")]
+#[command(about = "Vision-LLM Agent for the reMarkable")]
 #[command(
-    long_about = "Ghostwriter is an exploration of how to interact with vision-LLM through the handwritten medium of the reMarkable2. It is a pluggable system; you can provide a custom prompt and custom 'tools' that the agent can use."
+    long_about = "Ghostwriter is an exploration of how to interact with vision-LLM through the handwritten medium of the reMarkable. It is a pluggable system; you can provide a custom prompt and custom 'tools' that the agent can use."
 )]
 #[command(after_help = "See https://github.com/awwaiid/ghostwriter for updates!")]
 pub struct Args {
-    /// Sets the engine to use (openai, anthropic);
+    /// Sets the engine to use (openai, anthropic, google);
     /// Sometimes we can guess the engine from the model name
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     engine: Option<String>,
 
     /// Sets the base URL for the engine API;
-    /// Or use environment variable OPENAI_BASE_URL or ANTHROPIC_BASE_URL
+    /// Or use environment variable OPENAI_BASE_URL, ANTHROPIC_BASE_URL or GOOGLE_BASE_URL
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     engine_base_url: Option<String>,
 
     /// Sets the API key for the engine;
-    /// Or use environment variable OPENAI_API_KEY or ANTHROPIC_API_KEY
+    /// Or use environment variable OPENAI_API_KEY, ANTHROPIC_API_KEY or GOOGLE_API_KEY
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     engine_api_key: Option<String>,
@@ -177,7 +173,7 @@ pub struct Args {
     #[serde(skip)]
     web_port: u16,
 
-    /// Enable test/simulation mode for specific device (rm2, rmpp)
+    /// Enable test/simulation mode for specific device (rm2, rmpp, rmpure)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     test_mode: Option<String>,
@@ -319,7 +315,7 @@ async fn ghostwriter(args: &Args, mut config: Config) -> Result<()> {
             let simulation_config = SimulationConfig::from_config(&config);
             Touch::new_simulated(simulation_config, trigger_corner)?
         } else {
-            Touch::new(config.no_draw, trigger_corner)
+            Touch::new(config.no_draw, trigger_corner)?
         };
         Some(Arc::new(TokioRwLock::new(touch)))
     } else {
@@ -418,20 +414,17 @@ async fn run_ghostwriter_loop(
     let keyboard = shared!(Keyboard::new(
         config.is_test_mode() || config.no_draw || config.no_keyboard,
         config.no_draw_progress,
-    ));
+    )?);
 
-    let pen = shared!(Pen::new(config.is_test_mode() || config.no_draw));
+    let pen = shared!(Pen::new(config.is_test_mode() || config.no_draw)?);
 
     let touch = if let Some(shared_touch) = shared_touch {
         shared_touch
     } else {
-        Arc::new(TokioRwLock::new(Touch::new(config.no_draw, trigger_corner)))
+        Arc::new(TokioRwLock::new(Touch::new(config.no_draw, trigger_corner)?))
     };
 
-    // Give keyboard time to initialize
-    // sleep(Duration::from_millis(1000)).await;
     touch.write().await.tap_middle_bottom().await?;
-    // sleep(Duration::from_millis(1000)).await;
     lock!(keyboard).progress("Ghostwriter starting...")?;
     sleep(Duration::from_millis(1000)).await;
     lock!(keyboard).progress_end()?;
@@ -496,20 +489,11 @@ async fn run_ghostwriter_loop(
             Some(_trigger_event) = trigger_rx.recv() => {
                 info!("Main: trigger received, starting processing");
 
-                // Update progress to indicate we're processing (not waiting for triggers)
-                // let _ = progress_tx.send(ProgressState::TakingScreenshot);
-
                 // Create a new execution cycle for this processing run
                 cancellation.new_execution_cycle();
 
-                // Spawn cancel monitor to allow user to interrupt
-                // let cancel_handle = {
-                //     let touch_clone = Arc::clone(&touch);
-                //     let cancellation_clone = Arc::clone(&cancellation);
-                //     tokio::spawn(async move {
-                //         coordinator::cancel_monitor_task(touch_clone, cancellation_clone).await
-                //     })
-                // };
+                // TODO: also spawn coordinator::cancel_monitor_task here, so a touch can
+                // interrupt processing (and stop it again once processing finishes)
 
                 // Spawn processing task
                 let processing_handle = {
@@ -529,16 +513,10 @@ async fn run_ghostwriter_loop(
                     })
                 };
 
-                // Wait for either processing to complete or user to cancel
-                // The cancel_monitor will trigger cancellation which processing_task respects
                 let processing_result = processing_handle.await;
 
-                // Cancel the cancel monitor (it may still be waiting)
+                // End this execution cycle
                 cancellation.cancel_execution();
-                // let _ = tokio::time::timeout(
-                //     Duration::from_millis(100),
-                //     cancel_handle
-                // ).await;
 
                 match processing_result {
                     Ok(Ok(_)) => {
@@ -620,7 +598,7 @@ fn register_tools(
     let no_draw = config.no_draw;
     let keyboard_clone = Arc::clone(&keyboard);
 
-    let tool_config_draw_text = load_config("tool_draw_text.json");
+    let tool_config_draw_text = load_config("tool_draw_text.json")?;
     engine.register_tool(
         "draw_text",
         serde_json::from_str::<serde_json::Value>(tool_config_draw_text.as_str())?,
@@ -654,7 +632,7 @@ fn register_tools(
         let pen_clone = Arc::clone(&pen);
         let test_mode = config.is_test_mode();
 
-        let tool_config_draw_svg = load_config("tool_draw_svg.json");
+        let tool_config_draw_svg = load_config("tool_draw_svg.json")?;
         engine.register_tool(
             "draw_svg",
             serde_json::from_str::<serde_json::Value>(tool_config_draw_svg.as_str())?,
@@ -677,7 +655,7 @@ fn register_tools(
                 // holds the shared touch RwLock indefinitely while waiting for user trigger
                 let previous_tool = if !no_draw && !test_mode {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await })
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_fineliner().await })
                     })
                     .unwrap_or(PenTool::Unknown)
                 } else {
@@ -695,7 +673,7 @@ fn register_tools(
                 // Restore the original tool after drawing
                 if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.restore_tool(previous_tool).await })
                     })
                     .ok();
                 }
