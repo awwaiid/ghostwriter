@@ -290,9 +290,9 @@ fn determine_engine_name(engine_arg: &Option<String>, model: &str) -> Result<Str
 
 fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dyn LLMEngine>> {
     match engine_name {
-        "openai" => Ok(Box::new(OpenAI::new(engine_options))),
-        "anthropic" => Ok(Box::new(Anthropic::new(engine_options))),
-        "google" => Ok(Box::new(Google::new(engine_options))),
+        "openai" => Ok(Box::new(OpenAI::new(engine_options)?)),
+        "anthropic" => Ok(Box::new(Anthropic::new(engine_options)?)),
+        "google" => Ok(Box::new(Google::new(engine_options)?)),
         _ => Err(anyhow::anyhow!(
             "Unknown engine '{}'. Supported engines: openai, anthropic, google",
             engine_name
@@ -446,6 +446,9 @@ async fn run_ghostwriter_loop(
     }
     if let Some(api_key) = &config.engine_api_key {
         engine_options.insert("api_key".to_string(), api_key.clone());
+    } else if config.no_submit {
+        // Nothing is sent to the model in no-submit mode, so don't insist on an API key
+        engine_options.insert("api_key".to_string(), String::new());
     }
     if config.web_search {
         engine_options.insert("web_search".to_string(), "true".to_string());

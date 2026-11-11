@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dotenv;
 use image::GrayImage;
 use log::{debug, info};
@@ -134,21 +134,18 @@ pub fn write_bitmap_to_file(bitmap: &[Vec<bool>], filename: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn option_or_env(options: &OptionMap, key: &str, env_key: &str) -> String {
-    let option = options.get(key);
-    if let Some(value) = option {
-        value.to_string()
-    } else {
-        std::env::var(env_key).unwrap().to_string()
+/// The option `key` if it was given, otherwise the environment variable `env_key`.
+pub fn option_or_env(options: &OptionMap, key: &str, env_key: &str) -> Result<String> {
+    match options.get(key) {
+        Some(value) => Ok(value.clone()),
+        None => std::env::var(env_key).with_context(|| format!("{env_key} is not set (and no '{key}' option was given)")),
     }
 }
 
 pub fn option_or_env_fallback(options: &OptionMap, key: &str, env_key: &str, fallback: &str) -> String {
-    let option = options.get(key);
-    if let Some(value) = option {
-        value.to_string()
-    } else {
-        std::env::var(env_key).unwrap_or_else(|_| fallback.to_string())
+    match options.get(key) {
+        Some(value) => value.clone(),
+        None => std::env::var(env_key).unwrap_or_else(|_| fallback.to_string()),
     }
 }
 
