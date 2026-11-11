@@ -24,7 +24,7 @@ Install by getting the binary to your remarkable. On your not-remarkable (ie. yo
 # For the reMarkable2
 wget -O ghostwriter https://github.com/awwaiid/ghostwriter/releases/latest/download/ghostwriter-rm2
 
-# For the reMarkable Paper Pro
+# For the reMarkable Paper Pro (and the other aarch64 devices: Paper Pro Move, Paper Pure)
 wget -O ghostwriter https://github.com/awwaiid/ghostwriter/releases/latest/download/ghostwriter-rmpp
 
 # Replace this ip address with your remarkable ip address

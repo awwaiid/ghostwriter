@@ -9,22 +9,31 @@ Ghostwriter is a Vision-LLM agent for the reMarkable tablet that watches handwri
 ## Core Architecture
 
 - **main.rs**: Main application entry point with CLI argument parsing and orchestration
+- **coordinator.rs**: The trigger, progress and processing tasks (screenshot → LLM → tool call)
+- **config.rs**: Settings layered from defaults, `~/.ghostwriter.toml`, `GHOSTWRITER_*` env vars and CLI flags
+- **cancellation.rs**: Tokens for interrupting a run or restarting on a config change
 - **LLM Engine Layer** (`src/llm_engine/`): Pluggable backends for different AI providers
   - `openai.rs`: OpenAI API integration (GPT models)
   - `anthropic.rs`: Anthropic API integration (Claude models) 
   - `google.rs`: Google API integration (Gemini models)
-  - `mod.rs`: Common LLM engine trait and interface
+  - `mod.rs`: Common LLM engine trait, plus the HTTP request and tool dispatch the engines share
 - **Device Interaction** (`src/`):
-  - `screenshot.rs`: Screen capture functionality for both reMarkable2 and Paper Pro
+  - `device.rs`: Device detection and every per-device value (input device paths, pen/touch ranges, framebuffer size, the virtual page size)
+  - `screenshot.rs`: Screen capture by reading the framebuffer out of xochitl's memory
   - `pen.rs`: SVG drawing and bitmap rendering to screen 
   - `keyboard.rs`: Virtual keyboard input via uinput
-  - `touch.rs`: Touch event detection and gesture recognition
+  - `touch.rs`: Touch event detection, simulated taps, and pen tool selection through the palette
 - **Image Processing**:
   - `segmenter.rs`: Image segmentation to provide spatial context to LLMs
-  - `util.rs`: SVG to bitmap conversion and other utilities
+  - `skeleton.rs`: Thinning and tracing for single-stroke drawing experiments
+  - `util.rs`: SVG to bitmap conversion, uinput setup and other utilities
 - **Configuration**:
   - `prompts/`: JSON-based prompt templates and tool definitions
   - `embedded_assets.rs`: Bundled configuration files
+- **Off-device and experiments**:
+  - `simulation/`: Scripted touches and canned screenshots for `--test-mode`
+  - `web_server.rs`, `web/`: Optional configuration UI (`--web-server`)
+  - `bin/experiment.rs`: Command-line tool for trying pen and touch techniques on a Paper Pro
 
 ## Common Development Commands
 
@@ -40,7 +49,7 @@ cross build --release --target=armv7-unknown-linux-gnueabihf
 # or
 ./build.sh
 
-# Cross-compile for reMarkable Paper Pro (aarch64)  
+# Cross-compile for reMarkable Paper Pro, Paper Pro Move and Paper Pure (aarch64)
 cross build --release --target=aarch64-unknown-linux-gnu
 # or
 ./build.sh rmpp
@@ -54,11 +63,11 @@ cargo fmt
 # Check formatting without applying changes
 cargo fmt -- --check
 
-# Run clippy linting
-cargo clippy
+# Run clippy the way CI does
+cargo clippy --all-targets --all-features -- -D warnings
 
-# Run clippy with stricter warnings
-cargo clippy -- -D warnings
+# Run the unit tests
+cargo test
 
 # Check code compiles
 cargo check --all-targets --all-features
@@ -96,10 +105,12 @@ scp target/aarch64-unknown-linux-gnu/release/ghostwriter root@192.168.1.117:
 - Docker required for cross-compilation
 
 ### Device-Specific Considerations
-- reMarkable2 uses armv7 architecture, Paper Pro uses aarch64
-- Paper Pro requires uinput kernel module to be loaded (handled automatically)
-- Screen resolutions and input handling differ between devices
+- reMarkable2 uses armv7 architecture; Paper Pro, Paper Pro Move and Paper Pure use aarch64
+- The virtual keyboard needs the uinput kernel module; `setup_uinput` loads it if the firmware doesn't already
+- Screen resolutions and input handling differ between devices; add or change a device in `src/device.rs`
 - Virtual display size is normalized to 768x1024 pixels
+- Screen capture reads the framebuffer out of xochitl's memory, and where it lives moves between firmware versions (the Paper Pro changed at 3.29); `screenshot.rs` documents each layout
+- Paper Pro Move support was contributed (PR #19) and has not been tested by the maintainer
 
 ### Environment Variables
 Set API keys for different LLM providers:
