@@ -124,6 +124,18 @@ pub fn setup_uinput() -> Result<()> {
         return Ok(());
     }
 
+    // The firmware's own module, if it ships one
+    if command_output("modprobe", &["uinput"]).is_some() {
+        info!("Loaded the system uinput module with modprobe");
+        return Ok(());
+    }
+    if let Some(module_path) = command_output("find", &["/usr/lib/modules", "-name", "uinput.ko"]).and_then(|found| found.lines().next().map(str::to_string)) {
+        if command_output("insmod", &[&module_path]).is_some() {
+            info!("Loaded the system uinput module from {}", module_path);
+            return Ok(());
+        }
+    }
+
     if device_model == DeviceModel::RemarkablePaperPro {
         if let Some((major, minor)) = firmware_version() {
             let version = format!("{major}.{minor}");

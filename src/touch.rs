@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_touch_in_the_chosen_corner_is_a_trigger() {
-        for device in [DeviceModel::Remarkable2, DeviceModel::RemarkablePaperPro] {
+        for device in [DeviceModel::Remarkable2, DeviceModel::RemarkablePaperPro, DeviceModel::RemarkablePaperProMove] {
             // Touch the upper-right corner of the page, in the device's own coordinates
             let (x, y) = Touch::input_to_virtual(Touch::virtual_to_input((750, 20), &device), &device);
             assert!(Touch::is_in_trigger_zone(x, y, TriggerCorner::UpperRight), "{device:?}");

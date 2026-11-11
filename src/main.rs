@@ -173,7 +173,7 @@ pub struct Args {
     #[serde(skip)]
     web_port: u16,
 
-    /// Enable test/simulation mode for specific device (rm2, rmpp, rmpure)
+    /// Enable test/simulation mode for specific device (rm2, rmpp, rmpure, move)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     test_mode: Option<String>,

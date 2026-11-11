@@ -71,6 +71,7 @@ impl Screenshot {
                 }
             }
             DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => 4,
+            DeviceModel::RemarkablePaperProMove => 2,
             DeviceModel::Unknown => 2, // Default to RM2
         }
     }
@@ -132,7 +133,7 @@ impl Screenshot {
 
     fn find_framebuffer_address(&self, pid: &str) -> Result<u64> {
         match self.device_model() {
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure | DeviceModel::RemarkablePaperProMove => {
                 // arm64 devices: the approach from goMarkableStream's pointer_arm64.go
                 let start_address = self.get_memory_range(pid)?;
                 self.calculate_frame_pointer(pid, start_address)
@@ -226,6 +227,11 @@ impl Screenshot {
                 // 32-bit RGBA
                 debug!("Decoding {}x{} RGBA framebuffer", width, height);
                 Ok(RgbaImage::from_raw(width, height, raw_data).ok_or_else(invalid_size)?.into())
+            }
+            DeviceModel::RemarkablePaperProMove => {
+                // 16 bits per pixel with the grey level in the low byte, already in portrait.
+                let grey: Vec<u8> = raw_data.as_chunks::<2>().0.iter().map(|pixel| pixel[0]).collect();
+                Ok(GrayImage::from_raw(width, height, grey).ok_or_else(invalid_size)?.into())
             }
             DeviceModel::Remarkable2 | DeviceModel::Unknown => {
                 if self.bytes_per_pixel() == 4 {

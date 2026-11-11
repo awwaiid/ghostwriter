@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn bitmap_pixels_land_where_their_virtual_coordinates_do() {
-        for device_model in [DeviceModel::Remarkable2, DeviceModel::RemarkablePaperPro] {
+        for device_model in [DeviceModel::Remarkable2, DeviceModel::RemarkablePaperPro, DeviceModel::RemarkablePaperProMove] {
             let pen = pen(device_model);
             // Pixel (2x, 2y) of a double-resolution bitmap is virtual point (x, y)
             for point in [(0, 0), (100, 200), (384, 512), (767, 1023)] {

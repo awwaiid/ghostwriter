@@ -12,6 +12,7 @@ pub enum DeviceModel {
     Remarkable2,
     RemarkablePaperPro,
     RemarkablePaperPure,
+    RemarkablePaperProMove,
     Unknown,
 }
 
@@ -30,7 +31,8 @@ impl DeviceModel {
             "rm2" | "remarkable2" | "remarkable-2" => Ok(DeviceModel::Remarkable2),
             "rmpp" | "remarkable-paper-pro" | "remarkablepaperpro" | "paperpro" | "ferrari" => Ok(DeviceModel::RemarkablePaperPro),
             "rmpure" | "tatsu" | "paperpure" => Ok(DeviceModel::RemarkablePaperPure),
-            _ => Err(anyhow::anyhow!("Invalid device model: {}. Use 'rm2', 'rmpp' or 'rmpure'", s)),
+            "rmppm" | "move" | "chiappa" | "paperpromove" => Ok(DeviceModel::RemarkablePaperProMove),
+            _ => Err(anyhow::anyhow!("Invalid device model: {}. Use 'rm2', 'rmpp', 'rmpure' or 'move'", s)),
         }
     }
 
@@ -46,6 +48,8 @@ impl DeviceModel {
             DeviceModel::Remarkable2
         } else if hwrev.contains("tatsu 1.0") {
             DeviceModel::RemarkablePaperPure
+        } else if hwrev.contains("chiappa 1.0") {
+            DeviceModel::RemarkablePaperProMove
         } else {
             DeviceModel::Unknown
         }
@@ -56,6 +60,7 @@ impl DeviceModel {
             DeviceModel::Remarkable2 => "Remarkable2",
             DeviceModel::RemarkablePaperPro => "RemarkablePaperPro",
             DeviceModel::RemarkablePaperPure => "RemarkablePaperPure",
+            DeviceModel::RemarkablePaperProMove => "RemarkablePaperProMove",
             DeviceModel::Unknown => "Unknown",
         }
     }
@@ -65,7 +70,7 @@ impl DeviceModel {
     pub fn input_orientation(&self) -> InputOrientation {
         match self {
             DeviceModel::Remarkable2 | DeviceModel::Unknown => InputOrientation::Rm2,
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => InputOrientation::Portrait,
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure | DeviceModel::RemarkablePaperProMove => InputOrientation::Portrait,
         }
     }
 
@@ -73,7 +78,7 @@ impl DeviceModel {
     pub fn touch_device_path(&self) -> &'static str {
         match self {
             DeviceModel::Remarkable2 | DeviceModel::Unknown => "/dev/input/event2",
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => "/dev/input/event3",
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure | DeviceModel::RemarkablePaperProMove => "/dev/input/event3",
         }
     }
 
@@ -81,7 +86,7 @@ impl DeviceModel {
     pub fn pen_device_path(&self) -> &'static str {
         match self {
             DeviceModel::Remarkable2 | DeviceModel::Unknown => "/dev/input/event1",
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => "/dev/input/event2",
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure | DeviceModel::RemarkablePaperProMove => "/dev/input/event2",
         }
     }
 
@@ -91,6 +96,7 @@ impl DeviceModel {
             DeviceModel::Remarkable2 | DeviceModel::Unknown => (1404, 1872),
             DeviceModel::RemarkablePaperPro => (2065, 2833),
             DeviceModel::RemarkablePaperPure => (1776, 2400),
+            DeviceModel::RemarkablePaperProMove => (1248, 2208),
         }
     }
 
@@ -100,6 +106,7 @@ impl DeviceModel {
             DeviceModel::Remarkable2 | DeviceModel::Unknown => (15725, 20966),
             DeviceModel::RemarkablePaperPro => (11180, 15340),
             DeviceModel::RemarkablePaperPure => (9620, 13000),
+            DeviceModel::RemarkablePaperProMove => (6760, 11960),
         }
     }
 
@@ -110,6 +117,8 @@ impl DeviceModel {
             DeviceModel::Remarkable2 | DeviceModel::Unknown => (1872, 1404),
             DeviceModel::RemarkablePaperPro => (1632, 2154),
             DeviceModel::RemarkablePaperPure => (1404, 1872),
+            // The panel is 954 pixels wide; rows are padded to 960.
+            DeviceModel::RemarkablePaperProMove => (960, 1696),
         }
     }
 }
@@ -144,6 +153,7 @@ mod tests {
         assert_eq!(DeviceModel::from_string("rm2").unwrap(), DeviceModel::Remarkable2);
         assert_eq!(DeviceModel::from_string("RMPP").unwrap(), DeviceModel::RemarkablePaperPro);
         assert_eq!(DeviceModel::from_string("tatsu").unwrap(), DeviceModel::RemarkablePaperPure);
+        assert_eq!(DeviceModel::from_string("move").unwrap(), DeviceModel::RemarkablePaperProMove);
         assert!(DeviceModel::from_string("kindle").is_err());
     }
 }
