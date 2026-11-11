@@ -1,7 +1,7 @@
 use image::{GrayImage, Rgb, RgbImage};
 use imageproc::contours::find_contours;
 use imageproc::geometry::{contour_area, min_area_rect};
-use log::{debug, trace};
+use log::trace;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -28,12 +28,12 @@ impl ImageAnalyzer {
     }
 
     pub fn analyze_image(&self, image_path: &str) -> Result<SegmentationResult, Box<dyn std::error::Error>> {
-        // trace!("Reading image from: {}", image_path);
+        trace!("Reading image from: {}", image_path);
 
         // Read image and convert to grayscale
         let img = image::open(image_path)?.to_rgb8();
         let (width, height) = img.dimensions();
-        // trace!("Image loaded: {}x{}", width, height);
+        trace!("Image loaded: {}x{}", width, height);
 
         // Convert to grayscale
         let gray: GrayImage = image::imageops::grayscale(&img);
@@ -44,7 +44,7 @@ impl ImageAnalyzer {
 
         // Find contours
         let contours = find_contours(&binary);
-        // trace!("Found {} contours", contours.len());
+        trace!("Found {} contours", contours.len());
 
         // Process regions
         let mut regions = Vec::new();
@@ -54,11 +54,12 @@ impl ImageAnalyzer {
             let area = contour_area(&contour.points) as f32;
 
             if area >= min_area {
+                // The corners of the fitted rectangle can fall just outside the image, so clamp them
                 let bounds = min_area_rect(&contour.points);
-                let x_min = bounds.iter().map(|p| p.x).min().unwrap_or(0) as u32;
-                let y_min = bounds.iter().map(|p| p.y).min().unwrap_or(0) as u32;
-                let x_max = bounds.iter().map(|p| p.x).max().unwrap_or(0) as u32;
-                let y_max = bounds.iter().map(|p| p.y).max().unwrap_or(0) as u32;
+                let x_min = bounds.iter().map(|p| p.x).min().unwrap_or(0).max(0) as u32;
+                let y_min = bounds.iter().map(|p| p.y).min().unwrap_or(0).max(0) as u32;
+                let x_max = bounds.iter().map(|p| p.x).max().unwrap_or(0).max(0) as u32;
+                let y_max = bounds.iter().map(|p| p.y).max().unwrap_or(0).max(0) as u32;
                 let width = x_max - x_min;
                 let height = y_max - y_min;
 
@@ -76,7 +77,7 @@ impl ImageAnalyzer {
         regions.sort_by(|a, b| b.area.partial_cmp(&a.area).unwrap());
         regions.truncate(self.max_regions);
 
-        // trace!("Processed {} significant regions", regions.len());
+        trace!("Processed {} significant regions", regions.len());
 
         Ok(SegmentationResult {
             regions,
@@ -133,66 +134,20 @@ impl ImageAnalyzer {
     }
 }
 
-pub fn analyze_image(image_path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    trace!("Reading image from: {}", image_path);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Read image and convert to grayscale
-    let img = image::open(image_path)?.to_rgb8();
-    let (width, height) = img.dimensions();
-    trace!("Image loaded: {}x{}", width, height);
+    #[test]
+    fn regions_stay_within_the_image() {
+        // This image has a region whose fitted rectangle pokes past the image's edge
+        let analyzer = ImageAnalyzer::new(0.001, 10);
+        let result = analyzer.analyze_image("evaluations/tic_tac_toe_1/input.png").unwrap();
 
-    // Convert to grayscale
-    let gray: GrayImage = image::imageops::grayscale(&img);
-
-    // Simple thresholding
-    let binary = gray.clone().into_raw().into_iter().map(|p| if p > 127 { 255 } else { 0 }).collect::<Vec<u8>>();
-    let binary = GrayImage::from_raw(width, height, binary).ok_or("Failed to create binary image")?;
-
-    // Find contours
-    let contours = find_contours(&binary);
-    debug!("Found {} contours", contours.len());
-
-    // Process regions
-    let mut regions = Vec::new();
-    let min_area = 50.0; // (width * height) as f32 * 0.001; // Assuming min_region_size is 0.01
-    trace!("Min region area: {}", min_area);
-
-    for contour in contours {
-        let area = contour_area(&contour.points) as f32;
-        trace!("Contour area: {}", area);
-
-        if area >= min_area {
-            let bounds = min_area_rect(&contour.points);
-            let x_min = bounds.iter().map(|p| p.x).min().unwrap_or(0) as u32;
-            let y_min = bounds.iter().map(|p| p.y).min().unwrap_or(0) as u32;
-            let x_max = bounds.iter().map(|p| p.x).max().unwrap_or(0) as u32;
-            let y_max = bounds.iter().map(|p| p.y).max().unwrap_or(0) as u32;
-            let width = x_max - x_min;
-            let height = y_max - y_min;
-
-            let contour_points: Vec<(u32, u32)> = contour.points.iter().map(|p| (p.x as u32, p.y as u32)).collect();
-
-            regions.push(Region {
-                bounds: (x_min, y_min, width, height),
-                area: area as u32,
-                contour_points,
-            });
+        assert!(!result.regions.is_empty());
+        for region in &result.regions {
+            let (x, y, _width, _height) = region.bounds;
+            assert!(x < result.image_size.0 && y < result.image_size.1, "{:?}", region.bounds);
         }
     }
-
-    // Sort by area and limit number of regions
-    regions.sort_by(|a, b| b.area.partial_cmp(&a.area).unwrap());
-    regions.truncate(10); // Assuming max_regions is 10
-
-    trace!("Processed {} significant regions", regions.len());
-
-    let mut result = String::new();
-    for region in regions {
-        result.push_str(&format!(
-            "Region: x={}, y={}, width={}, height={}\n",
-            region.bounds.0, region.bounds.1, region.bounds.2, region.bounds.3
-        ));
-    }
-
-    Ok(result)
 }

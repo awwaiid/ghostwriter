@@ -1,18 +1,13 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use evdev::EventType as EvdevEventType;
 use evdev::{Device, InputEvent};
 use log::info;
 use resvg::usvg;
-use resvg::usvg::{fontdb, Options, Tree};
-use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use crate::device::DeviceModel;
-
-// Output dimensions remain the same for both devices
-const VIRTUAL_WIDTH: u32 = 768;
-const VIRTUAL_HEIGHT: u32 = 1024;
+use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
+use crate::util::parse_svg;
 
 pub struct Pen {
     device: Option<Device>,
@@ -20,20 +15,18 @@ pub struct Pen {
 }
 
 impl Pen {
-    pub fn new(no_draw: bool) -> Self {
+    pub fn new(no_draw: bool) -> Result<Self> {
         let device_model = DeviceModel::detect();
         info!("Pen using device model: {}", device_model.name());
 
-        let pen_input_device = match device_model {
-            DeviceModel::Remarkable2 => "/dev/input/event1",
-            DeviceModel::RemarkablePaperPro => "/dev/input/event2",
-            DeviceModel::RemarkablePaperPure => "/dev/input/event2",
-            DeviceModel::Unknown => "/dev/input/event1", // Default to RM2
+        let device = if no_draw {
+            None
+        } else {
+            let device_path = device_model.pen_device_path();
+            Some(Device::open(device_path).with_context(|| format!("Failed to open pen device {device_path}"))?)
         };
 
-        let device = if no_draw { None } else { Some(Device::open(pen_input_device).unwrap()) };
-
-        Self { device, device_model }
+        Ok(Self { device, device_model })
     }
 
     pub fn draw_line_screen(&mut self, p1: (i32, i32), p2: (i32, i32)) -> Result<()> {
@@ -41,17 +34,9 @@ impl Pen {
     }
 
     pub fn draw_line(&mut self, (x1, y1): (i32, i32), (x2, y2): (i32, i32)) -> Result<()> {
-        // trace!("Drawing from ({}, {}) to ({}, {})", x1, y1, x2, y2);
-
-        // We know this is a straight line
-        // So figure out the length
-        // Then divide it into enough steps to only go 10 units or so
-        // Start at x1, y1
-        // And then for each step add the right amount to x and y
-
+        // Divide the line into steps of at most 5 units
         let length = ((x2 as f32 - x1 as f32).powf(2.0) + (y2 as f32 - y1 as f32).powf(2.0)).sqrt();
-        // 5.0 is the maximum distance between points
-        let steps = (length / 5.0).ceil() as i32;
+        let steps = ((length / 5.0).ceil() as i32).max(1);
 
         self.pen_up()?;
         self.pen_down_at((x1, y1))?;
@@ -78,23 +63,17 @@ impl Pen {
     /// Input coordinates are computed directly from bitmap pixel position for true sub-pixel accuracy,
     /// bypassing integer rounding through the virtual coordinate space.
     pub fn draw_bitmap_scaled(&mut self, bitmap: &[Vec<bool>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
-        let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
-        let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
-
         let mut is_pen_down = false;
         for (y, row) in bitmap.iter().enumerate() {
             for (x, &pixel) in row.iter().enumerate() {
                 if pixel {
-                    let ix = ((x as f32 / bmp_w) * max_x).round() as i32;
-                    let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
+                    let point = self.bitmap_to_input(x, y, scale);
                     if !is_pen_down {
-                        self.pen_down_at((ix, iy))?;
+                        self.pen_down_at(point)?;
                         is_pen_down = true;
                         sleep(Duration::from_millis(1));
                     }
-                    self.goto_xy((ix, iy))?;
+                    self.goto_xy(point)?;
                 } else if is_pen_down {
                     self.pen_up()?;
                     is_pen_down = false;
@@ -108,24 +87,6 @@ impl Pen {
         }
         Ok(())
     }
-
-    // fn draw_dot(device: &mut Device, (x, y): (i32, i32)) -> Result<()> {
-    //     // trace!("Drawing at ({}, {})", x, y);
-    //     goto_xy(device, (x, y))?;
-    //     pen_down(device)?;
-    //
-    //     // Wiggle a little bit
-    //     for n in 0..2 {
-    //         goto_xy(device, (x + n, y + n))?;
-    //     }
-    //
-    //     pen_up(device)?;
-    //
-    //     // sleep for 5ms
-    //     thread::sleep(time::Duration::from_millis(1));
-    //
-    //     Ok(())
-    // }
 
     pub fn pen_down(&mut self) -> Result<()> {
         if let Some(device) = &mut self.device {
@@ -192,28 +153,6 @@ impl Pen {
             ])?;
         }
         Ok(())
-    }
-
-    pub fn max_x_value(&self) -> i32 {
-        match self.device_model {
-            DeviceModel::Remarkable2 => 15725,
-            DeviceModel::RemarkablePaperPro => 11180,
-            DeviceModel::RemarkablePaperPure => 9620,
-            DeviceModel::Unknown => 15725, // Default to RM2
-        }
-    }
-
-    pub fn max_y_value(&self) -> i32 {
-        match self.device_model {
-            DeviceModel::Remarkable2 => 20966,
-            DeviceModel::RemarkablePaperPro => 15340,
-            DeviceModel::RemarkablePaperPure => 13000,
-            DeviceModel::Unknown => 20966, // Default to RM2
-        }
-    }
-
-    pub fn virtual_to_input_pub(&self, point: (i32, i32)) -> (i32, i32) {
-        self.virtual_to_input(point)
     }
 
     // Draw a single segment from prev to (px,py), emitting interpolated goto_xy events.
@@ -341,14 +280,8 @@ impl Pen {
     /// Draw a bitmap bidirectionally — alternating L→R and R→L per row.
     /// This cancels the directional bias that causes horizontal leaking.
     pub fn draw_bitmap_bidi(&mut self, bitmap: &[Vec<bool>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
-        let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
-        let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
-
         let mut is_pen_down = false;
         for (y, row) in bitmap.iter().enumerate() {
-            let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
             let cols = row.len();
 
             // Collect runs in this row
@@ -376,16 +309,13 @@ impl Pen {
                 // For L→R draw start→end; for R→L draw end→start
                 let (draw_from, draw_to) = if go_left { (x_end, x_start) } else { (x_start, x_end) };
 
-                let ix_from = ((draw_from as f32 / bmp_w) * max_x).round() as i32;
-                let ix_to = ((draw_to as f32 / bmp_w) * max_x).round() as i32;
-
                 if is_pen_down {
                     self.pen_up()?;
                     sleep(Duration::from_millis(1));
                 }
-                self.pen_down_at((ix_from, iy))?;
+                self.pen_down_at(self.bitmap_to_input(draw_from, y, scale))?;
                 sleep(Duration::from_millis(1));
-                self.goto_xy((ix_to, iy))?;
+                self.goto_xy(self.bitmap_to_input(draw_to, y, scale))?;
                 self.pen_up()?;
                 is_pen_down = false;
                 sleep(Duration::from_millis(1));
@@ -404,11 +334,6 @@ impl Pen {
     /// Draw a bitmap column-first — scanning each column top→bottom.
     /// This rotates the directional bias 90° so it appears vertically instead of horizontally.
     pub fn draw_bitmap_col(&mut self, bitmap: &[Vec<bool>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
-        let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
-        let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
-
         if bitmap.is_empty() {
             return Ok(());
         }
@@ -417,25 +342,23 @@ impl Pen {
 
         #[allow(clippy::needless_range_loop)]
         for x in 0..cols {
-            let ix = ((x as f32 / bmp_w) * max_x).round() as i32;
-
             let mut is_pen_down = false;
             let mut run_start: Option<usize> = None;
 
             for y in 0..rows {
                 let pixel = bitmap[y][x];
-                let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
+                let point = self.bitmap_to_input(x, y, scale);
 
                 match (pixel, run_start) {
                     (true, None) => {
                         run_start = Some(y);
-                        self.pen_down_at((ix, iy))?;
+                        self.pen_down_at(point)?;
                         is_pen_down = true;
                         sleep(Duration::from_millis(1));
-                        self.goto_xy((ix, iy))?;
+                        self.goto_xy(point)?;
                     }
                     (true, Some(_)) => {
-                        self.goto_xy((ix, iy))?;
+                        self.goto_xy(point)?;
                     }
                     (false, Some(_)) => {
                         run_start = None;
@@ -460,14 +383,7 @@ impl Pen {
     /// Takes a Vec<Vec<u8>> of alpha values (0-255) and draws each pixel
     /// with pressure proportional to its alpha value.
     pub fn draw_bitmap_alpha_pressure(&mut self, alpha_bitmap: &[Vec<u8>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
-        let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
-        let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
-
         for (y, row) in alpha_bitmap.iter().enumerate() {
-            let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
-
             let mut is_pen_down = false;
             let mut last_pressure: i32 = 0;
 
@@ -481,7 +397,7 @@ impl Pen {
                     continue;
                 }
 
-                let ix = ((x as f32 / bmp_w) * max_x).round() as i32;
+                let point = self.bitmap_to_input(x, y, scale);
                 let pressure = (alpha as f32 / 255.0 * 2630.0).round() as i32;
 
                 if !is_pen_down || pressure != last_pressure {
@@ -489,11 +405,11 @@ impl Pen {
                         self.pen_up()?;
                         sleep(Duration::from_millis(1));
                     }
-                    self.goto_xy_with_pressure((ix, iy), pressure)?;
+                    self.goto_xy_with_pressure(point, pressure)?;
                     is_pen_down = true;
                     last_pressure = pressure;
                 } else {
-                    self.goto_xy((ix, iy))?;
+                    self.goto_xy(point)?;
                 }
             }
 
@@ -533,11 +449,7 @@ impl Pen {
     /// Text is converted to glyph paths by usvg before tracing.
     pub fn draw_svg_paths(&mut self, svg_data: &str) -> Result<()> {
         // Use usvg to parse and flatten text → paths
-        let mut opt = Options::default();
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
-        opt.fontdb = Arc::new(db);
-        let tree = Tree::from_str(svg_data, &opt)?;
+        let tree = parse_svg(svg_data)?;
         let write_opt = usvg::WriteOptions::default(); // preserve_text=false → converts text to paths
         let flattened_svg = tree.to_string(&write_opt);
 
@@ -614,21 +526,66 @@ impl Pen {
         self.draw_polylines(&polylines)
     }
 
-    fn virtual_to_input(&self, (x, y): (i32, i32)) -> (i32, i32) {
-        // Swap and normalize the coordinates
-        let x_normalized = x as f32 / VIRTUAL_WIDTH as f32;
-        let y_normalized = y as f32 / VIRTUAL_HEIGHT as f32;
+    /// Convert a position on the page, as fractions of its width and height, to pen digitizer coordinates.
+    fn page_to_input(&self, x_fraction: f32, y_fraction: f32) -> (f32, f32) {
+        let (pen_width, pen_height) = self.device_model.pen_size();
+        match self.device_model.input_orientation() {
+            InputOrientation::Portrait => (x_fraction * pen_width as f32, y_fraction * pen_height as f32),
+            // The digitizer is rotated: its x axis runs up the page and its y axis across it.
+            InputOrientation::Rm2 => ((1.0 - y_fraction) * pen_height as f32, x_fraction * pen_width as f32),
+        }
+    }
 
-        match self.device_model {
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
-                let x_input = (x_normalized * self.max_x_value() as f32) as i32;
-                let y_input = (y_normalized * self.max_y_value() as f32) as i32;
-                (x_input, y_input)
-            }
-            _ => {
-                let x_input = ((1.0 - y_normalized) * self.max_y_value() as f32) as i32;
-                let y_input = (x_normalized * self.max_x_value() as f32) as i32;
-                (x_input, y_input)
+    /// Convert a virtual page coordinate to pen digitizer coordinates.
+    pub fn virtual_to_input(&self, (x, y): (i32, i32)) -> (i32, i32) {
+        let (x_input, y_input) = self.page_to_input(x as f32 / VIRTUAL_WIDTH as f32, y as f32 / VIRTUAL_HEIGHT as f32);
+        (x_input as i32, y_input as i32)
+    }
+
+    /// Pen digitizer coordinates of pixel (x, y) in a bitmap that covers the page
+    /// at `scale` pixels per virtual unit. Computed straight from the pixel position,
+    /// so a scaled bitmap keeps its sub-unit precision.
+    fn bitmap_to_input(&self, x: usize, y: usize, scale: u32) -> (i32, i32) {
+        let (x_input, y_input) = self.page_to_input(x as f32 / (VIRTUAL_WIDTH * scale) as f32, y as f32 / (VIRTUAL_HEIGHT * scale) as f32);
+        (x_input.round() as i32, y_input.round() as i32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pen(device_model: DeviceModel) -> Pen {
+        Pen { device: None, device_model }
+    }
+
+    #[test]
+    fn paper_pro_maps_the_page_straight_onto_the_digitizer() {
+        let pen = pen(DeviceModel::RemarkablePaperPro);
+        assert_eq!(pen.virtual_to_input((0, 0)), (0, 0));
+        assert_eq!(pen.virtual_to_input((384, 512)), (5590, 7670));
+        assert_eq!(pen.virtual_to_input((768, 1024)), (11180, 15340));
+    }
+
+    #[test]
+    fn rm2_digitizer_is_rotated() {
+        let pen = pen(DeviceModel::Remarkable2);
+        // Top-left of the page is the far end of the digitizer's x axis
+        assert_eq!(pen.virtual_to_input((0, 0)), (20966, 0));
+        assert_eq!(pen.virtual_to_input((768, 0)), (20966, 15725));
+        assert_eq!(pen.virtual_to_input((0, 1024)), (0, 0));
+        assert_eq!(pen.virtual_to_input((384, 512)), (10483, 7862));
+    }
+
+    #[test]
+    fn bitmap_pixels_land_where_their_virtual_coordinates_do() {
+        for device_model in [DeviceModel::Remarkable2, DeviceModel::RemarkablePaperPro, DeviceModel::RemarkablePaperProMove] {
+            let pen = pen(device_model);
+            // Pixel (2x, 2y) of a double-resolution bitmap is virtual point (x, y)
+            for point in [(0, 0), (100, 200), (384, 512), (767, 1023)] {
+                let (expected_x, expected_y) = pen.virtual_to_input(point);
+                let (x, y) = pen.bitmap_to_input(point.0 as usize * 2, point.1 as usize * 2, 2);
+                assert!((x - expected_x).abs() <= 1 && (y - expected_y).abs() <= 1, "{device_model:?} {point:?}");
             }
         }
     }

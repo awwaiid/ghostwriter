@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use evdev::EventType as EvdevEventType;
 use evdev::{Device, EventStream, InputEvent};
 use log::{debug, info, trace};
@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::cancellation::GhostwriterCancellation;
-use crate::device::DeviceModel;
+use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::screenshot::Screenshot;
 use crate::simulation::{SimulationConfig, TouchSimulator};
 
@@ -44,10 +44,6 @@ impl TriggerCorner {
     }
 }
 
-// Output dimensions remain the same for both devices
-const VIRTUAL_WIDTH: u16 = 768;
-const VIRTUAL_HEIGHT: u16 = 1024;
-
 // Event codes
 const ABS_MT_SLOT: u16 = 47;
 const ABS_MT_TOUCH_MAJOR: u16 = 48;
@@ -55,7 +51,6 @@ const ABS_MT_TOUCH_MINOR: u16 = 49;
 const ABS_MT_ORIENTATION: u16 = 52;
 const ABS_MT_POSITION_X: u16 = 53;
 const ABS_MT_POSITION_Y: u16 = 54;
-// const ABS_MT_TOOL_TYPE: u16 = 55;
 const ABS_MT_TRACKING_ID: u16 = 57;
 const ABS_MT_PRESSURE: u16 = 58;
 
@@ -77,34 +72,27 @@ pub struct Touch {
 }
 
 impl Touch {
-    pub fn new(no_touch: bool, trigger_corner: TriggerCorner) -> Self {
+    pub fn new(no_touch: bool, trigger_corner: TriggerCorner) -> Result<Self> {
         let device_model = DeviceModel::detect();
         info!("Touch using device model: {}", device_model.name());
-
-        let device_path = match device_model {
-            DeviceModel::Remarkable2 => "/dev/input/event2",
-            DeviceModel::RemarkablePaperPro => "/dev/input/event3",
-            DeviceModel::RemarkablePaperPure => "/dev/input/event3",
-            DeviceModel::Unknown => "/dev/input/event2", // Default to RM2
-        };
 
         let (input_device, event_stream) = if no_touch {
             (None, None)
         } else {
-            let input_dev = Device::open(device_path).unwrap();
-            let read_dev = Device::open(device_path).unwrap();
-            let stream = read_dev.into_event_stream().unwrap();
-            (Some(input_dev), Some(stream))
+            let device_path = device_model.touch_device_path();
+            let open = || Device::open(device_path).with_context(|| format!("Failed to open touch device {device_path}"));
+            let stream = open()?.into_event_stream()?;
+            (Some(open()?), Some(stream))
         };
 
-        Self {
+        Ok(Self {
             mode: TouchMode::Real {
                 input_device,
                 event_stream,
                 device_model,
             },
             trigger_corner,
-        }
+        })
     }
 
     pub fn new_simulated(simulation_config: SimulationConfig, trigger_corner: TriggerCorner) -> Result<Self> {
@@ -285,8 +273,6 @@ impl Touch {
         self.touch_start((384, 1023)).await?; // middle bottom
         sleep(Duration::from_millis(100)).await;
         self.touch_stop().await?;
-        // sleep(Duration::from_millis(10));
-        // sleep(Duration::from_millis(100));
         Ok(())
     }
 
@@ -501,55 +487,28 @@ impl Touch {
         }
     }
 
+    /// Convert a virtual page coordinate to the touchscreen's own coordinates.
     fn virtual_to_input((x, y): (i32, i32), device_model: &DeviceModel) -> (i32, i32) {
-        // Swap and normalize the coordinates
         let x_normalized = x as f32 / VIRTUAL_WIDTH as f32;
-        let y_normalized = y as f32 / VIRTUAL_HEIGHT as f32;
-        let (screen_width, screen_height) = Self::screen_dimensions(device_model);
-
-        match device_model {
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
-                let x_input = (x_normalized * screen_width as f32) as i32;
-                let y_input = (y_normalized * screen_height as f32) as i32;
-                (x_input, y_input)
-            }
-            _ => {
-                // RM2 coordinate transformation
-                let x_input = (x_normalized * screen_width as f32) as i32;
-                let y_input = ((1.0 - y_normalized) * screen_height as f32) as i32;
-                (x_input, y_input)
-            }
+        let mut y_normalized = y as f32 / VIRTUAL_HEIGHT as f32;
+        if device_model.input_orientation() == InputOrientation::Rm2 {
+            y_normalized = 1.0 - y_normalized;
         }
+        let (touch_width, touch_height) = device_model.touch_size();
+
+        ((x_normalized * touch_width as f32) as i32, (y_normalized * touch_height as f32) as i32)
     }
 
+    /// Convert a touchscreen coordinate to the virtual page.
     fn input_to_virtual((x, y): (i32, i32), device_model: &DeviceModel) -> (i32, i32) {
-        // Swap and normalize the coordinates
-        let (screen_width, screen_height) = Self::screen_dimensions(device_model);
-        let x_normalized = x as f32 / screen_width as f32;
-        let y_normalized = y as f32 / screen_height as f32;
-
-        match device_model {
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
-                let x_input = (x_normalized * VIRTUAL_WIDTH as f32) as i32;
-                let y_input = (y_normalized * VIRTUAL_HEIGHT as f32) as i32;
-                (x_input, y_input)
-            }
-            _ => {
-                // RM2 coordinate transformation
-                let x_input = (x_normalized * VIRTUAL_WIDTH as f32) as i32;
-                let y_input = ((1.0 - y_normalized) * VIRTUAL_HEIGHT as f32) as i32;
-                (x_input, y_input)
-            }
+        let (touch_width, touch_height) = device_model.touch_size();
+        let x_normalized = x as f32 / touch_width as f32;
+        let mut y_normalized = y as f32 / touch_height as f32;
+        if device_model.input_orientation() == InputOrientation::Rm2 {
+            y_normalized = 1.0 - y_normalized;
         }
-    }
 
-    fn screen_dimensions(device_model: &DeviceModel) -> (u32, u32) {
-        match device_model {
-            DeviceModel::Remarkable2 => (1404, 1872),
-            DeviceModel::RemarkablePaperPro => (2065, 2833),
-            DeviceModel::RemarkablePaperPure => (1776, 2400),
-            DeviceModel::Unknown => (1404, 1872), // Default to RM2
-        }
+        ((x_normalized * VIRTUAL_WIDTH as f32) as i32, (y_normalized * VIRTUAL_HEIGHT as f32) as i32)
     }
 
     /// Update the trigger corner (called when config changes)
@@ -572,6 +531,36 @@ impl Touch {
     pub fn add_manual_trigger(&self, corner: TriggerCorner) {
         if let TouchMode::Simulated { simulator } = &self.mode {
             simulator.add_manual_trigger(corner);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paper_pro_touch_coordinates_scale_directly() {
+        let device = DeviceModel::RemarkablePaperPro;
+        assert_eq!(Touch::virtual_to_input((384, 1023), &device), (1032, 2830));
+        assert_eq!(Touch::input_to_virtual((2065, 0), &device), (768, 0));
+    }
+
+    #[test]
+    fn rm2_touch_y_axis_is_flipped() {
+        let device = DeviceModel::Remarkable2;
+        assert_eq!(Touch::virtual_to_input((0, 0), &device), (0, 1872));
+        assert_eq!(Touch::virtual_to_input((768, 1024), &device), (1404, 0));
+        assert_eq!(Touch::input_to_virtual((1404, 1872), &device), (768, 0));
+    }
+
+    #[test]
+    fn a_touch_in_the_chosen_corner_is_a_trigger() {
+        for device in [DeviceModel::Remarkable2, DeviceModel::RemarkablePaperPro, DeviceModel::RemarkablePaperProMove] {
+            // Touch the upper-right corner of the page, in the device's own coordinates
+            let (x, y) = Touch::input_to_virtual(Touch::virtual_to_input((750, 20), &device), &device);
+            assert!(Touch::is_in_trigger_zone(x, y, TriggerCorner::UpperRight), "{device:?}");
+            assert!(!Touch::is_in_trigger_zone(x, y, TriggerCorner::LowerLeft), "{device:?}");
         }
     }
 }

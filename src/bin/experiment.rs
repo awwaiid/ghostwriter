@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use evdev::{Device, EventType as EvdevEventType, InputEvent};
+use ghostwriter::device::{VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use ghostwriter::pen::Pen;
 use ghostwriter::screenshot::Screenshot;
 use ghostwriter::touch::{PenTool, Touch, TriggerCorner};
@@ -11,10 +12,6 @@ use tokio::time::sleep;
 
 // Touch device for RMPP
 const TOUCH_DEVICE: &str = "/dev/input/event3";
-
-// Virtual coordinate space
-const VIRTUAL_WIDTH: f32 = 768.0;
-const VIRTUAL_HEIGHT: f32 = 1024.0;
 
 // RMPP touch input space
 const TOUCH_SCREEN_WIDTH: f32 = 2065.0;
@@ -31,8 +28,8 @@ const ABS_MT_TRACKING_ID: u16 = 57;
 const ABS_MT_PRESSURE: u16 = 58;
 
 fn virtual_to_touch(x: i32, y: i32) -> (i32, i32) {
-    let tx = (x as f32 / VIRTUAL_WIDTH * TOUCH_SCREEN_WIDTH) as i32;
-    let ty = (y as f32 / VIRTUAL_HEIGHT * TOUCH_SCREEN_HEIGHT) as i32;
+    let tx = (x as f32 / VIRTUAL_WIDTH as f32 * TOUCH_SCREEN_WIDTH) as i32;
+    let ty = (y as f32 / VIRTUAL_HEIGHT as f32 * TOUCH_SCREEN_HEIGHT) as i32;
     (tx, ty)
 }
 
@@ -117,7 +114,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawLine { x1, y1, x2, y2 } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_line_screen((x1, y1), (x2, y2))
             })
             .await?;
@@ -126,7 +123,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawDot { x, y } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.pen_up()?;
                 pen.goto_xy_virtual((x, y))?;
                 pen.pen_down()?;
@@ -144,7 +141,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawRect { x1, y1, x2, y2 } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_line_screen((x1, y1), (x2, y1))?; // top
                 pen.draw_line_screen((x2, y1), (x2, y2))?; // right
                 pen.draw_line_screen((x2, y2), (x1, y2))?; // bottom
@@ -156,7 +153,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawTriangle { x1, y1, x2, y2, x3, y3 } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_line_screen((x1, y1), (x2, y2))?;
                 pen.draw_line_screen((x2, y2), (x3, y3))?;
                 pen.draw_line_screen((x3, y3), (x1, y1))
@@ -167,13 +164,13 @@ async fn main() -> Result<()> {
 
         Commands::DrawCircle { cx, cy, r } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 let circumference = 2.0 * std::f32::consts::PI * r as f32;
                 let steps = (circumference / 3.0).ceil() as usize;
                 pen.pen_up()?;
                 let x0 = cx + r;
                 let y0 = cy;
-                pen.pen_down_at(pen.virtual_to_input_pub((x0, y0)))?;
+                pen.pen_down_at(pen.virtual_to_input((x0, y0)))?;
                 for i in 0..=steps {
                     let angle = 2.0 * std::f32::consts::PI * i as f32 / steps as f32;
                     let x = (cx as f32 + r as f32 * angle.cos()).round() as i32;
@@ -189,9 +186,9 @@ async fn main() -> Result<()> {
         Commands::DrawSvg { svg_string } => {
             // Render at 2x resolution for sub-pixel accuracy; draw_bitmap_scaled maps back
             let scale = 2u32;
-            let bitmap = svg_to_bitmap(&svg_string, 768 * scale, 1024 * scale)?;
+            let bitmap = svg_to_bitmap(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_scaled(&bitmap, scale)
             })
             .await?;
@@ -200,7 +197,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgCenterline { svg_string } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_svg_centerline(&svg_string)
             })
             .await?;
@@ -214,7 +211,7 @@ async fn main() -> Result<()> {
                 y, font_size, text
             );
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_svg_centerline(&svg_string)
             })
             .await?;
@@ -223,7 +220,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgPaths { svg_string } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_svg_paths(&svg_string)
             })
             .await?;
@@ -232,7 +229,7 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgPathsRaw { svg_string } => {
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_svg_paths_raw(&svg_string)
             })
             .await?;
@@ -243,7 +240,7 @@ async fn main() -> Result<()> {
             let img = image::open(&png_path)?.to_luma8();
             let bitmap: Vec<Vec<bool>> = img.rows().map(|row| row.map(|p| p[0] < 128).collect()).collect();
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap(&bitmap)
             })
             .await?;
@@ -251,7 +248,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Tap { x, y } => {
-            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
             touch.touch_start((x, y)).await?;
             sleep(Duration::from_millis(100)).await;
             touch.touch_stop().await?;
@@ -264,7 +261,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Swipe { x1, y1, x2, y2 } => {
-            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
             touch.touch_start((x1, y1)).await?;
             let steps = 20i32;
             for i in 0..=steps {
@@ -279,7 +276,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::NewPage => {
-            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
             // Swipe right-to-left to bring up the page navigation UI
             touch.touch_start((700, 512)).await?;
             let steps = 20i32;
@@ -310,13 +307,13 @@ async fn main() -> Result<()> {
         }
 
         Commands::SelectFineliner => {
-            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
             let previous = touch.select_fineliner().await?;
             println!("SelectFineliner: switched to fineliner (was {:?})", previous);
         }
 
         Commands::SelectBallpoint => {
-            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
             let previous = touch.switch_to_tool(PenTool::Ballpoint).await?;
             println!("SelectBallpoint: switched to ballpoint (was {:?})", previous);
         }
@@ -342,9 +339,9 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgBidi { svg_string } => {
             let scale = 2u32;
-            let bitmap = svg_to_bitmap(&svg_string, 768 * scale, 1024 * scale)?;
+            let bitmap = svg_to_bitmap(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_bidi(&bitmap, scale)
             })
             .await?;
@@ -353,9 +350,9 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgCol { svg_string } => {
             let scale = 2u32;
-            let bitmap = svg_to_bitmap(&svg_string, 768 * scale, 1024 * scale)?;
+            let bitmap = svg_to_bitmap(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_col(&bitmap, scale)
             })
             .await?;
@@ -364,9 +361,9 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgAlphaPressure { svg_string } => {
             let scale = 2u32;
-            let alpha_bitmap = svg_to_alpha_bitmap(&svg_string, 768 * scale, 1024 * scale)?;
+            let alpha_bitmap = svg_to_alpha_bitmap(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)
             })
             .await?;
@@ -375,9 +372,9 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgThreshold { svg_string, threshold } => {
             let scale = 2u32;
-            let bitmap = svg_to_bitmap_threshold(&svg_string, 768 * scale, 1024 * scale, threshold)?;
+            let bitmap = svg_to_bitmap_threshold(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale, threshold)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_scaled(&bitmap, scale)
             })
             .await?;
@@ -386,9 +383,9 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgScale3x { svg_string } => {
             let scale = 3u32;
-            let bitmap = svg_to_bitmap(&svg_string, 768 * scale, 1024 * scale)?;
+            let bitmap = svg_to_bitmap(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_scaled(&bitmap, scale)
             })
             .await?;
@@ -397,9 +394,9 @@ async fn main() -> Result<()> {
 
         Commands::DrawSvgThresholdBidi { svg_string, threshold } => {
             let scale = 2u32;
-            let bitmap = svg_to_bitmap_threshold(&svg_string, 768 * scale, 1024 * scale, threshold)?;
+            let bitmap = svg_to_bitmap_threshold(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale, threshold)?;
             with_fineliner(|| {
-                let mut pen = Pen::new(false);
+                let mut pen = Pen::new(false)?;
                 pen.draw_bitmap_bidi(&bitmap, scale)
             })
             .await?;
@@ -412,7 +409,7 @@ async fn main() -> Result<()> {
 
 /// Switch to fineliner (with correct size/color settings), run drawing closure, then restore.
 async fn with_fineliner<F: FnOnce() -> Result<()>>(f: F) -> Result<()> {
-    let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+    let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
     let previous = touch.select_fineliner().await?;
     sleep(Duration::from_millis(500)).await; // Wait for palette close animation to finish
     let result = f();

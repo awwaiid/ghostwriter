@@ -186,8 +186,6 @@ async fn get_status_handler(shared_status: Arc<TokioRwLock<GhostwriterStatus>>) 
 
 #[derive(Debug)]
 enum ConfigError {
-    #[allow(dead_code)]
-    Load(String),
     Save(String),
     Validation(String),
 }
@@ -199,7 +197,6 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         (StatusCode::NOT_FOUND, "Not Found".to_string())
     } else if let Some(config_err) = err.find::<ConfigError>() {
         match config_err {
-            ConfigError::Load(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load config: {}", msg)),
             ConfigError::Save(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", msg)),
             ConfigError::Validation(msg) => (StatusCode::BAD_REQUEST, format!("Config validation failed: {}", msg)),
         }

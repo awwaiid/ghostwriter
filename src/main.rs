@@ -13,7 +13,7 @@ use ghostwriter::{
     cancellation::GhostwriterCancellation,
     config::Config,
     coordinator::{self, CoordinatorChannels, ProgressState},
-    device::DeviceModel,
+    device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
     embedded_assets::load_config,
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
@@ -25,144 +25,182 @@ use ghostwriter::{
     web_server::start_web_server,
 };
 
-// Output dimensions remain the same for both devices
-const VIRTUAL_WIDTH: u32 = 768;
-const VIRTUAL_HEIGHT: u32 = 1024;
-
+/// Command-line arguments.
+///
+/// These are layered on top of defaults, ~/.ghostwriter.toml, and GHOSTWRITER_*
+/// environment variables (see `Config::load`). Only flags actually passed on the
+/// command line should override those, so unset options and `false` switches are
+/// skipped during serialization; defaults live in `Config::default()`.
 #[derive(Parser, Serialize)]
 #[command(author, version)]
-#[command(about = "Vision-LLM Agent for the reMarkable2")]
+#[command(about = "Vision-LLM Agent for the reMarkable")]
 #[command(
-    long_about = "Ghostwriter is an exploration of how to interact with vision-LLM through the handwritten medium of the reMarkable2. It is a pluggable system; you can provide a custom prompt and custom 'tools' that the agent can use."
+    long_about = "Ghostwriter is an exploration of how to interact with vision-LLM through the handwritten medium of the reMarkable. It is a pluggable system; you can provide a custom prompt and custom 'tools' that the agent can use."
 )]
 #[command(after_help = "See https://github.com/awwaiid/ghostwriter for updates!")]
 pub struct Args {
-    /// Sets the engine to use (openai, anthropic);
+    /// Sets the engine to use (openai, anthropic, google);
     /// Sometimes we can guess the engine from the model name
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     engine: Option<String>,
 
     /// Sets the base URL for the engine API;
-    /// Or use environment variable OPENAI_BASE_URL or ANTHROPIC_BASE_URL
+    /// Or use environment variable OPENAI_BASE_URL, ANTHROPIC_BASE_URL or GOOGLE_BASE_URL
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     engine_base_url: Option<String>,
 
     /// Sets the API key for the engine;
-    /// Or use environment variable OPENAI_API_KEY or ANTHROPIC_API_KEY
+    /// Or use environment variable OPENAI_API_KEY, ANTHROPIC_API_KEY or GOOGLE_API_KEY
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     engine_api_key: Option<String>,
 
-    /// Sets the model to use
-    #[arg(long, short, default_value = "claude-sonnet-4-6")]
-    model: String,
+    /// Sets the model to use (default: claude-sonnet-4-6)
+    #[arg(long, short)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 
-    /// Sets the prompt to use
-    #[arg(long, default_value = "general.json")]
-    prompt: String,
+    /// Sets the prompt to use (default: general.json)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
 
     /// Do not actually submit to the model, for testing
     #[arg(short, long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_submit: bool,
 
     /// Skip running draw_text or draw_svg, for testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_draw: bool,
 
     /// Disable SVG drawing tool
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_svg: bool,
 
     /// Disable keyboard
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_keyboard: bool,
 
     /// Disable keyboard progress
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_draw_progress: bool,
 
     /// Input PNG file for testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_png: Option<String>,
 
     /// Output file for testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     output_file: Option<String>,
 
     /// Output file for model parameters
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     model_output_file: Option<String>,
 
     /// Save screenshot filename
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     save_screenshot: Option<String>,
 
     /// Save bitmap filename
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     save_bitmap: Option<String>,
 
     /// Disable looping
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_loop: bool,
 
     /// Disable waiting for trigger
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     no_trigger: bool,
 
     /// Apply segmentation
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     apply_segmentation: bool,
 
     /// Enable web search (for Anthropic models)
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     web_search: bool,
 
     /// Enable model thinking (for Anthropic models)
     #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
     thinking: bool,
 
-    /// Set the thinking token budget (for Anthropic models)
-    #[arg(long, default_value = "5000")]
-    thinking_tokens: u32,
+    /// Set the thinking token budget (for Anthropic models; default: 5000)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_tokens: Option<u32>,
 
-    /// Set the log level. Try 'debug' or 'trace'
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Set the log level (default: info). Try 'debug' or 'trace'
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_level: Option<String>,
 
-    /// Sets which corner the touch trigger listens to (UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left)
-    #[arg(long, default_value = "UR")]
-    trigger_corner: String,
+    /// Sets which corner the touch trigger listens to (default: UR).
+    /// Options: UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_corner: Option<String>,
 
     /// Save current configuration to ~/.ghostwriter.toml and exit
     #[arg(long)]
+    #[serde(skip)]
     save_config: bool,
 
     /// Start web server for configuration UI
     #[arg(long)]
+    #[serde(skip)]
     web_server: bool,
 
     /// Port for web server (default: 8080)
     #[arg(long, default_value = "8080")]
+    #[serde(skip)]
     web_port: u16,
 
-    /// Enable test/simulation mode for specific device (rm2, rmpp)
+    /// Enable test/simulation mode for specific device (rm2, rmpp, rmpure, move)
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_mode: Option<String>,
 
     /// File containing scripted touch events for simulation (JSON format)
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_touch_events_file: Option<String>,
 
     /// Directory containing test screenshots to cycle through
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_screenshot_dir: Option<String>,
 
     /// Auto-trigger delay in seconds for automated testing
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_auto_trigger_delay: Option<u32>,
 
     /// File to log simulated interactions to
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_interaction_log: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[tokio::main]
@@ -171,13 +209,24 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log_level.as_str()))
+    // Load config before starting the logger so log_level can come from the
+    // config file or environment, not just the CLI
+    let config = Config::load(&args)?;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(config.log_level.as_str()))
         .format_timestamp_millis()
         .init();
 
+    // Handle --save-config option (before touching any devices)
+    if args.save_config {
+        config.save()?;
+        println!("Configuration saved to {:?}", Config::config_path()?);
+        return Ok(());
+    }
+
     setup_uinput()?;
 
-    ghostwriter(&args).await
+    ghostwriter(&args, config).await
 }
 
 macro_rules! shared {
@@ -237,9 +286,9 @@ fn determine_engine_name(engine_arg: &Option<String>, model: &str) -> Result<Str
 
 fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dyn LLMEngine>> {
     match engine_name {
-        "openai" => Ok(Box::new(OpenAI::new(engine_options))),
-        "anthropic" => Ok(Box::new(Anthropic::new(engine_options))),
-        "google" => Ok(Box::new(Google::new(engine_options))),
+        "openai" => Ok(Box::new(OpenAI::new(engine_options)?)),
+        "anthropic" => Ok(Box::new(Anthropic::new(engine_options)?)),
+        "google" => Ok(Box::new(Google::new(engine_options)?)),
         _ => Err(anyhow::anyhow!(
             "Unknown engine '{}'. Supported engines: openai, anthropic, google",
             engine_name
@@ -247,21 +296,12 @@ fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dy
     }
 }
 
-async fn ghostwriter(args: &Args) -> Result<()> {
-    let mut config = Config::load(args)?;
-
+async fn ghostwriter(args: &Args, mut config: Config) -> Result<()> {
     // Parse test_mode device model if provided
     if let Some(device_str) = &config.test_mode {
         let device_model = DeviceModel::from_string(device_str)?;
         config.test_device_model = Some(device_model);
         info!("Test mode enabled for device: {}", device_model.name());
-    }
-
-    // Handle --save-config option
-    if args.save_config {
-        config.save()?;
-        println!("Configuration saved to {:?}", Config::config_path()?);
-        return Ok(());
     }
 
     // Create shared state for live config updates
@@ -275,7 +315,7 @@ async fn ghostwriter(args: &Args) -> Result<()> {
             let simulation_config = SimulationConfig::from_config(&config);
             Touch::new_simulated(simulation_config, trigger_corner)?
         } else {
-            Touch::new(config.no_draw, trigger_corner)
+            Touch::new(config.no_draw, trigger_corner)?
         };
         Some(Arc::new(TokioRwLock::new(touch)))
     } else {
@@ -374,20 +414,17 @@ async fn run_ghostwriter_loop(
     let keyboard = shared!(Keyboard::new(
         config.is_test_mode() || config.no_draw || config.no_keyboard,
         config.no_draw_progress,
-    ));
+    )?);
 
-    let pen = shared!(Pen::new(config.is_test_mode() || config.no_draw));
+    let pen = shared!(Pen::new(config.is_test_mode() || config.no_draw)?);
 
     let touch = if let Some(shared_touch) = shared_touch {
         shared_touch
     } else {
-        Arc::new(TokioRwLock::new(Touch::new(config.no_draw, trigger_corner)))
+        Arc::new(TokioRwLock::new(Touch::new(config.no_draw, trigger_corner)?))
     };
 
-    // Give keyboard time to initialize
-    // sleep(Duration::from_millis(1000)).await;
     touch.write().await.tap_middle_bottom().await?;
-    // sleep(Duration::from_millis(1000)).await;
     lock!(keyboard).progress("Ghostwriter starting...")?;
     sleep(Duration::from_millis(1000)).await;
     lock!(keyboard).progress_end()?;
@@ -402,6 +439,9 @@ async fn run_ghostwriter_loop(
     }
     if let Some(api_key) = &config.engine_api_key {
         engine_options.insert("api_key".to_string(), api_key.clone());
+    } else if config.no_submit {
+        // Nothing is sent to the model in no-submit mode, so don't insist on an API key
+        engine_options.insert("api_key".to_string(), String::new());
     }
     if config.web_search {
         engine_options.insert("web_search".to_string(), "true".to_string());
@@ -449,20 +489,11 @@ async fn run_ghostwriter_loop(
             Some(_trigger_event) = trigger_rx.recv() => {
                 info!("Main: trigger received, starting processing");
 
-                // Update progress to indicate we're processing (not waiting for triggers)
-                // let _ = progress_tx.send(ProgressState::TakingScreenshot);
-
                 // Create a new execution cycle for this processing run
                 cancellation.new_execution_cycle();
 
-                // Spawn cancel monitor to allow user to interrupt
-                // let cancel_handle = {
-                //     let touch_clone = Arc::clone(&touch);
-                //     let cancellation_clone = Arc::clone(&cancellation);
-                //     tokio::spawn(async move {
-                //         coordinator::cancel_monitor_task(touch_clone, cancellation_clone).await
-                //     })
-                // };
+                // TODO: also spawn coordinator::cancel_monitor_task here, so a touch can
+                // interrupt processing (and stop it again once processing finishes)
 
                 // Spawn processing task
                 let processing_handle = {
@@ -482,16 +513,10 @@ async fn run_ghostwriter_loop(
                     })
                 };
 
-                // Wait for either processing to complete or user to cancel
-                // The cancel_monitor will trigger cancellation which processing_task respects
                 let processing_result = processing_handle.await;
 
-                // Cancel the cancel monitor (it may still be waiting)
+                // End this execution cycle
                 cancellation.cancel_execution();
-                // let _ = tokio::time::timeout(
-                //     Duration::from_millis(100),
-                //     cancel_handle
-                // ).await;
 
                 match processing_result {
                     Ok(Ok(_)) => {
@@ -573,7 +598,7 @@ fn register_tools(
     let no_draw = config.no_draw;
     let keyboard_clone = Arc::clone(&keyboard);
 
-    let tool_config_draw_text = load_config("tool_draw_text.json");
+    let tool_config_draw_text = load_config("tool_draw_text.json")?;
     engine.register_tool(
         "draw_text",
         serde_json::from_str::<serde_json::Value>(tool_config_draw_text.as_str())?,
@@ -607,7 +632,7 @@ fn register_tools(
         let pen_clone = Arc::clone(&pen);
         let test_mode = config.is_test_mode();
 
-        let tool_config_draw_svg = load_config("tool_draw_svg.json");
+        let tool_config_draw_svg = load_config("tool_draw_svg.json")?;
         engine.register_tool(
             "draw_svg",
             serde_json::from_str::<serde_json::Value>(tool_config_draw_svg.as_str())?,
@@ -630,7 +655,7 @@ fn register_tools(
                 // holds the shared touch RwLock indefinitely while waiting for user trigger
                 let previous_tool = if !no_draw && !test_mode {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await })
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_fineliner().await })
                     })
                     .unwrap_or(PenTool::Unknown)
                 } else {
@@ -648,7 +673,7 @@ fn register_tools(
                 // Restore the original tool after drawing
                 if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.restore_tool(previous_tool).await })
                     })
                     .ok();
                 }
@@ -657,4 +682,92 @@ fn register_tools(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A config file path unique to this test, removed on drop
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new(name: &str, contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("ghostwriter-test-{}-{}.toml", std::process::id(), name));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const FILE_CONFIG: &str = r#"
+        model = "model-from-file"
+        prompt = "prompt-from-file.json"
+        thinking_tokens = 1234
+        log_level = "debug"
+        trigger_corner = "LL"
+        engine = "openai"
+        no_draw = true
+        no_svg = true
+    "#;
+
+    #[test]
+    fn config_file_wins_over_unset_cli_args() {
+        let file = TempConfig::new("file-wins", FILE_CONFIG);
+        let args = Args::parse_from(["ghostwriter"]);
+        let config = Config::load_from(&args, &file.0).unwrap();
+
+        assert_eq!(config.model, "model-from-file");
+        assert_eq!(config.prompt, "prompt-from-file.json");
+        assert_eq!(config.thinking_tokens, 1234);
+        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.trigger_corner, "LL");
+        assert_eq!(config.engine.as_deref(), Some("openai"));
+        assert!(config.no_draw);
+        assert!(config.no_svg);
+    }
+
+    #[test]
+    fn explicit_cli_args_win_over_config_file() {
+        let file = TempConfig::new("cli-wins", FILE_CONFIG);
+        let args = Args::parse_from([
+            "ghostwriter",
+            "--model",
+            "model-from-cli",
+            "--trigger-corner",
+            "UL",
+            "--thinking-tokens",
+            "42",
+            "--no-keyboard",
+        ]);
+        let config = Config::load_from(&args, &file.0).unwrap();
+
+        assert_eq!(config.model, "model-from-cli");
+        assert_eq!(config.trigger_corner, "UL");
+        assert_eq!(config.thinking_tokens, 42);
+        assert!(config.no_keyboard);
+        // Not passed on the CLI, so still from the file
+        assert_eq!(config.prompt, "prompt-from-file.json");
+        assert!(config.no_draw);
+    }
+
+    #[test]
+    fn defaults_apply_without_config_file() {
+        let args = Args::parse_from(["ghostwriter"]);
+        let missing = std::env::temp_dir().join(format!("ghostwriter-test-{}-missing.toml", std::process::id()));
+        let config = Config::load_from(&args, &missing).unwrap();
+
+        let defaults = Config::default();
+        assert_eq!(config.model, defaults.model);
+        assert_eq!(config.prompt, "general.json");
+        assert_eq!(config.thinking_tokens, 5000);
+        assert_eq!(config.trigger_corner, "UR");
+        assert!(!config.no_draw);
+    }
 }

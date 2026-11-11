@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use rust_embed::Embed;
 
 #[derive(Embed)]
@@ -15,12 +16,15 @@ pub fn get_uinput_module_data(version: &str) -> Option<Vec<u8>> {
     AssetUtils::get(target_module_filename.as_str()).map(|asset| asset.data.to_vec())
 }
 
-pub fn load_config(filename: &str) -> String {
+/// Load a prompt or tool definition: a local file of that name if there is one,
+/// otherwise the copy bundled into the binary from `prompts/`.
+pub fn load_config(filename: &str) -> Result<String> {
     log::debug!("Loading config from {}", filename);
 
     if std::path::Path::new(filename).exists() {
-        std::fs::read_to_string(filename).unwrap()
+        std::fs::read_to_string(filename).with_context(|| format!("Failed to read {filename}"))
     } else {
-        std::str::from_utf8(AssetPrompts::get(filename).unwrap().data.as_ref()).unwrap().to_string()
+        let asset = AssetPrompts::get(filename).with_context(|| format!("No file or bundled prompt named '{filename}'"))?;
+        Ok(String::from_utf8(asset.data.into_owned())?)
     }
 }

@@ -20,8 +20,6 @@ use crate::touch::Touch;
 pub enum TriggerEvent {
     /// User touched the trigger corner
     UserTouch,
-    /// Trigger via web API (for testing/simulation)
-    WebTrigger,
 }
 
 /// Progress states during AI processing
@@ -38,13 +36,6 @@ pub enum ProgressState {
     LlmState(ModelExecutionStatus),
     /// Processing completed successfully
     Done,
-}
-
-/// Message from coordinator to processing task
-#[derive(Debug)]
-pub struct ProcessingRequest {
-    /// The trigger event that started this
-    pub trigger: TriggerEvent,
 }
 
 /// Communication channels for the coordinator
@@ -350,7 +341,7 @@ pub async fn processing_task(
     };
 
     // Load prompt
-    let prompt_general_raw = load_config(&config.prompt);
+    let prompt_general_raw = load_config(&config.prompt)?;
     let prompt_general_json = serde_json::from_str::<serde_json::Value>(prompt_general_raw.as_str())?;
     let mut prompt = prompt_general_json["prompt"]
         .as_str()
