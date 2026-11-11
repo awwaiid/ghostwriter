@@ -231,7 +231,14 @@ impl Screenshot {
                 if self.bytes_per_pixel() == 4 {
                     // Firmware 3.24+: data is stored portrait (1404×1872), 32-bit BGRA.
                     // Values are already full 8-bit range — don't apply the old aggressive curve.
-                    let grey: Vec<u8> = raw_data.as_chunks::<4>().0.iter().map(|bgra| bgra[0]).collect();
+                    // Convert with Rec. 601 luma rather than taking one channel: coloured ink (e.g. blue)
+                    // is near-white in its own channel and would vanish from the screenshot.
+                    let grey: Vec<u8> = raw_data
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bgra| ((bgra[2] as u32 * 299 + bgra[1] as u32 * 587 + bgra[0] as u32 * 114) / 1000) as u8)
+                        .collect();
                     Ok(GrayImage::from_raw(1404, 1872, grey).ok_or_else(invalid_size)?.into())
                 } else {
                     // Pre-3.24: data is stored landscape (1872×1404), 16-bit RGB565. Take high byte.
