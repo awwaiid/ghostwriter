@@ -65,6 +65,51 @@ const CHARACTER_KEYS: &[(EvdevKey, &str)] = &[
 
 const MODIFIER_KEYS: &[EvdevKey] = &[EvdevKey::KEY_LEFTSHIFT, EvdevKey::KEY_LEFTCTRL, EvdevKey::KEY_LEFTALT];
 
+/// The closest thing the keyboard can type for a character it has no key for.
+/// Models often reply with accented letters and typographic punctuation, and the
+/// virtual keyboard is a US layout without dead keys.
+fn ascii_fallback(c: char) -> Option<&'static str> {
+    Some(match c {
+        'à' | 'â' | 'ä' | 'á' | 'ã' | 'å' => "a",
+        'À' | 'Â' | 'Ä' | 'Á' | 'Ã' | 'Å' => "A",
+        'é' | 'è' | 'ê' | 'ë' => "e",
+        'É' | 'È' | 'Ê' | 'Ë' => "E",
+        'î' | 'ï' | 'í' | 'ì' => "i",
+        'Î' | 'Ï' | 'Í' | 'Ì' => "I",
+        'ô' | 'ö' | 'ó' | 'ò' | 'õ' => "o",
+        'Ô' | 'Ö' | 'Ó' | 'Ò' | 'Õ' => "O",
+        'ù' | 'û' | 'ü' | 'ú' => "u",
+        'Ù' | 'Û' | 'Ü' | 'Ú' => "U",
+        'ç' => "c",
+        'Ç' => "C",
+        'ñ' => "n",
+        'Ñ' => "N",
+        'ß' => "ss",
+        'œ' => "oe",
+        'Œ' => "OE",
+        'æ' => "ae",
+        'Æ' => "AE",
+        '’' | '‘' => "'",
+        '“' | '”' | '«' | '»' => "\"",
+        '–' | '—' | '−' => "-",
+        '…' => "...",
+        '•' => "*",
+        '×' => "x",
+        '÷' => "/",
+        '²' => "^2",
+        '³' => "^3",
+        '≈' => "~",
+        '≤' => "<=",
+        '≥' => ">=",
+        '≠' => "!=",
+        '→' => "->",
+        '←' => "<-",
+        '°' => " deg",
+        '\u{a0}' | '\u{202f}' => " ",
+        _ => return None,
+    })
+}
+
 pub struct Keyboard {
     device: Option<VirtualDevice>,
     /// The key for each character, and whether it needs shift
@@ -133,35 +178,48 @@ impl Keyboard {
         Ok(())
     }
 
-    /// Type a string. Characters that are not on the keyboard are skipped.
+    /// The keys to press to type a string, and whether each needs shift.
+    /// A character without a key becomes its ASCII fallback, or is skipped if it has none.
+    fn keys_for(&self, input: &str) -> Vec<(EvdevKey, bool)> {
+        let mut keys = Vec::new();
+        for c in input.chars() {
+            match self.key_map.get(&c) {
+                Some(&key) => keys.push(key),
+                None => keys.extend(ascii_fallback(c).unwrap_or_default().chars().filter_map(|c| self.key_map.get(&c))),
+            }
+        }
+        keys
+    }
+
+    /// Type a string.
     pub fn string_to_keypresses(&mut self, input: &str) -> Result<()> {
+        let keys = self.keys_for(input);
+
         if let Some(device) = &mut self.device {
             // make sure we are synced before we start; this might be paranoia
             device.emit(&[InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0)])?;
             thread::sleep(time::Duration::from_millis(10));
 
-            for c in input.chars() {
-                if let Some(&(key, shift)) = self.key_map.get(&c) {
-                    if shift {
-                        // Press Shift
-                        device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_LEFTSHIFT.code(), 1)])?;
-                    }
-
-                    // Press key
-                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, key.code(), 1)])?;
-
-                    // Release key
-                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, key.code(), 0)])?;
-
-                    if shift {
-                        // Release Shift
-                        device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_LEFTSHIFT.code(), 0)])?;
-                    }
-
-                    // Sync event
-                    device.emit(&[InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0)])?;
-                    thread::sleep(time::Duration::from_millis(10));
+            for (key, shift) in keys {
+                if shift {
+                    // Press Shift
+                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_LEFTSHIFT.code(), 1)])?;
                 }
+
+                // Press key
+                device.emit(&[InputEvent::new(EvdevEventType::KEY.0, key.code(), 1)])?;
+
+                // Release key
+                device.emit(&[InputEvent::new(EvdevEventType::KEY.0, key.code(), 0)])?;
+
+                if shift {
+                    // Release Shift
+                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_LEFTSHIFT.code(), 0)])?;
+                }
+
+                // Sync event
+                device.emit(&[InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0)])?;
+                thread::sleep(time::Duration::from_millis(10));
             }
         }
         Ok(())
@@ -241,5 +299,15 @@ mod tests {
         assert_eq!(key_map[&'\''], (EvdevKey::KEY_APOSTROPHE, false));
         assert_eq!(key_map[&'"'], (EvdevKey::KEY_APOSTROPHE, true));
         assert_eq!(key_map[&'\n'], (EvdevKey::KEY_ENTER, false));
+    }
+
+    #[test]
+    fn characters_without_a_key_are_typed_as_their_ascii_fallback() {
+        let keyboard = Keyboard::new(true, true).unwrap();
+
+        // Typographic punctuation and accents come out as plain ASCII
+        assert_eq!(keyboard.keys_for("café… “ok” — 5×2"), keyboard.keys_for("cafe... \"ok\" - 5x2"));
+        // A character with no fallback is skipped
+        assert_eq!(keyboard.keys_for("a🙂b"), keyboard.keys_for("ab"));
     }
 }
