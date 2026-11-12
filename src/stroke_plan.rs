@@ -240,6 +240,24 @@ impl Grid {
             .collect()
     }
 
+    /// Cells that are true here and false in `other`.
+    fn minus(&self, other: &Grid) -> Grid {
+        let cells = self.cells.iter().zip(&other.cells).map(|(&a, &b)| a && !b).collect();
+        Grid { cells, ..*self }
+    }
+
+    /// The true cells grown by one cell in every direction.
+    fn grown(&self) -> Grid {
+        let mut grown = Grid::new(self.width, self.height);
+        for y in 0..self.height as isize {
+            for x in 0..self.width as isize {
+                let near = (-1..=1).any(|dy| (-1..=1).any(|dx| self.at(x + dx, y + dy)));
+                grown.set(x as usize, y as usize, near);
+            }
+        }
+        grown
+    }
+
     /// For each cell, the length of the horizontal run of true cells it is in (0 if it is false).
     fn run_lengths(&self) -> Vec<u32> {
         let mut lengths = vec![0; self.cells.len()];
@@ -315,11 +333,14 @@ pub fn plan_drawing(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
                 .pixels()
                 .iter()
                 .map(|pixel| {
-                    // Most of a page is blank, and most of the rest is black: neither needs working out
+                    // Most of a page is blank, and most of the rest is black: neither needs
+                    // working out. Nor does a solid colour need its transparency undone.
                     if pixel.alpha() < 128 {
                         None
                     } else if pixel.alpha() == 255 && pixel.red() == 0 && pixel.green() == 0 && pixel.blue() == 0 {
                         Some(Ink::Black)
+                    } else if pixel.alpha() == 255 {
+                        Ink::nearest(pixel.red(), pixel.green(), pixel.blue())
                     } else {
                         let colour = pixel.demultiply();
                         Ink::nearest(colour.red(), colour.green(), colour.blue())
