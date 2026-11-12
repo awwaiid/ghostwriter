@@ -162,6 +162,10 @@ impl Ink {
     /// The ink nearest to a colour, or None if the white of the paper is nearer still:
     /// a white or pale shape is not drawn at all.
     pub fn nearest(red: u8, green: u8, blue: u8) -> Option<Ink> {
+        // White, or nearly: nearer to paper than to anything
+        if red >= 240 && green >= 240 && blue >= 240 {
+            return None;
+        }
         let far_from = |(r, g, b): (i32, i32, i32)| (red as i32 - r).pow(2) + (green as i32 - g).pow(2) + (blue as i32 - b).pow(2);
         let nearest = Ink::ALL.into_iter().min_by_key(|ink| far_from(ink.rgb()))?;
         (far_from(nearest.rgb()) < far_from((255, 255, 255))).then_some(nearest)
@@ -224,14 +228,6 @@ impl Grid {
         transposed
     }
 
-    /// The part of the grid `width` by `height` cells from (left, top).
-    fn cropped(&self, left: usize, top: usize, width: usize, height: usize) -> Grid {
-        let cells = (top..top + height)
-            .flat_map(|y| self.cells[y * self.width + left..y * self.width + left + width].iter().copied())
-            .collect();
-        Grid { width, height, cells }
-    }
-
     /// The first and last true cell of each row, for rows that have any.
     fn row_spans(&self) -> Vec<Option<(usize, usize)>> {
         self.cells
@@ -242,16 +238,6 @@ impl Grid {
                 Some((first, last))
             })
             .collect()
-    }
-
-    /// The smallest box holding every true cell, as (left, top, width, height).
-    fn bounds(&self) -> Option<(usize, usize, usize, usize)> {
-        let spans = self.row_spans();
-        let top = spans.iter().position(Option::is_some)?;
-        let bottom = spans.iter().rposition(Option::is_some)?;
-        let left = spans.iter().flatten().map(|span| span.0).min()?;
-        let right = spans.iter().flatten().map(|span| span.1).max()?;
-        Some((left, top, right - left + 1, bottom - top + 1))
     }
 
     /// Cells that are true here and false in `other`.
@@ -347,10 +333,18 @@ pub fn plan_drawing(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
                 .pixels()
                 .iter()
                 .map(|pixel| {
-                    let colour = pixel.demultiply();
-                    (colour.alpha() >= 128)
-                        .then(|| Ink::nearest(colour.red(), colour.green(), colour.blue()))
-                        .flatten()
+                    // Most of a page is blank, and most of the rest is black: neither needs
+                    // working out. Nor does a solid colour need its transparency undone.
+                    if pixel.alpha() < 128 {
+                        None
+                    } else if pixel.alpha() == 255 && pixel.red() == 0 && pixel.green() == 0 && pixel.blue() == 0 {
+                        Some(Ink::Black)
+                    } else if pixel.alpha() == 255 {
+                        Ink::nearest(pixel.red(), pixel.green(), pixel.blue())
+                    } else {
+                        let colour = pixel.demultiply();
+                        Ink::nearest(colour.red(), colour.green(), colour.blue())
+                    }
                 })
                 .collect();
             (inks, path_strokes::along_paths(&tree, page_size, pen))
@@ -373,16 +367,29 @@ pub fn plan_drawing(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
     lines.retain(|&(ink, (from, to))| ink_at(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0)) == Some(ink));
 
     let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
+    // Where on the page each ink is called for, as the edges of the box around it:
+    // left, top, right and bottom. Usually it is a small part of the page.
+    let mut called_for: [Option<(usize, usize, usize, usize)>; Ink::ALL.len()] = [None; Ink::ALL.len()];
+    for (index, ink) in inks.iter().enumerate().filter_map(|(index, ink)| Some((index, (*ink)?))) {
+        let (x, y) = (index % width, index / width);
+        let (left, top, right, bottom) = called_for[ink as usize].unwrap_or((x, y, x, y));
+        called_for[ink as usize] = Some((left.min(x), top.min(y), right.max(x), bottom.max(y)));
+    }
+
     let mut layers = Vec::new();
-    let called_for: std::collections::HashSet<Ink> = inks.iter().flatten().copied().collect();
-    for ink in Ink::ALL.into_iter().filter(|ink| called_for.contains(ink)) {
+    for ink in Ink::ALL {
+        let Some((left, top, right, bottom)) = called_for[ink as usize] else {
+            continue;
+        };
         let of_this_ink = Grid {
-            width,
-            height,
-            cells: inks.iter().map(|&at| at == Some(ink)).collect(),
+            width: right - left + 1,
+            height: bottom - top + 1,
+            cells: (top..=bottom)
+                .flat_map(|y| inks[y * width + left..=y * width + right].iter().map(|&at| at == Some(ink)))
+                .collect(),
         };
         let lines: Vec<Segment> = lines.iter().filter(|line| line.0 == ink).map(|line| line.1).collect();
-        let strokes = plan_one_ink(&of_this_ink, lines, page_size, pen);
+        let strokes = plan_one_ink(&of_this_ink, (left, top), lines, page_size, pen);
         if !strokes.is_empty() {
             debug!("{} strokes in {:?}, after {:?}", strokes.len(), ink, started.elapsed());
             let strokes = strokes
@@ -398,32 +405,27 @@ pub fn plan_drawing(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
     Ok(layers)
 }
 
-/// Plan the strokes for the part of a drawing that is in one ink: `ink` is where that
-/// is on the page, and `lines` are strokes already planned along the lines in it.
-fn plan_one_ink(ink: &Grid, lines: Vec<Segment>, page_size: (u32, u32), pen: &PenModel) -> Vec<Segment> {
+/// Plan the strokes for the part of a drawing that is in one ink. `ink` is the part of
+/// the page that ink is on, its corner at (`left`, `top`) on the page, and `lines` are
+/// strokes already planned along the lines in it. The strokes are in page pixels.
+fn plan_one_ink(ink: &Grid, (left, top): (usize, usize), lines: Vec<Segment>, page_size: (u32, u32), pen: &PenModel) -> Vec<Segment> {
     // The lines first, and then whatever they leave bare
     let mut covered = Grid::new(ink.width, ink.height);
     for &(from, to) in &lines {
-        for_each_pixel_near(from, to, page_size, pen, 0.0, |x, y, _, _| covered.set(x, y, true));
+        for_each_pixel_near(from, to, page_size, pen, 0.0, |x, y, _, _| {
+            if x >= left && y >= top && x - left < ink.width && y - top < ink.height {
+                covered.set(x - left, y - top, true);
+            }
+        });
     }
+    drop_slivers(ink, &mut covered);
+    let on_page = |(x, y): Point| (x + left as f32, y + top as f32);
     let mut strokes = lines;
-    // The rest is planned within the part of the page that has ink on it, which is
-    // usually a small part
-    if let Some((left, top, width, height)) = ink.bounds() {
-        let ink = ink.cropped(left, top, width, height);
-        let mut covered = covered.cropped(left, top, width, height);
-        drop_slivers(&ink, &mut covered);
-        let on_page = |(x, y): Point| (x + left as f32, y + top as f32);
-        strokes.extend(plan_ink(&ink, covered, pen).into_iter().map(|(from, to)| (on_page(from), on_page(to))));
+    strokes.extend(plan_ink(ink, covered, pen).into_iter().map(|(from, to)| (on_page(from), on_page(to))));
 
-        let in_the_crop = |(x, y): Point| (x - left as f32, y - top as f32);
-        let order = drawing_order(
-            &strokes.iter().map(|&(from, to)| (in_the_crop(from), in_the_crop(to))).collect::<Vec<_>>(),
-            &ink,
-        );
-        strokes = order.into_iter().map(|index| strokes[index]).collect();
-    }
-    strokes
+    let in_the_box = |(x, y): Point| (x - left as f32, y - top as f32);
+    let order = drawing_order(&strokes.iter().map(|&(from, to)| (in_the_box(from), in_the_box(to))).collect::<Vec<_>>(), ink);
+    order.into_iter().map(|index| strokes[index]).collect()
 }
 
 /// The order to draw strokes in, as indexes into `strokes`: one shape at a time, the
