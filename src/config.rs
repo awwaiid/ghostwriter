@@ -1,4 +1,5 @@
 use crate::device::DeviceModel;
+use crate::pen::DrawingPen;
 use crate::touch::TriggerCorner;
 use anyhow::Result;
 use figment::{
@@ -8,6 +9,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
 pub struct Config {
     // Direct mapping to CLI args - no arbitrary grouping
     pub engine: Option<String>,
@@ -20,6 +22,9 @@ pub struct Config {
     pub no_svg: bool,
     pub no_keyboard: bool,
     pub no_draw_progress: bool,
+    pub pen: String,
+    pub no_select_pen: bool,
+    pub no_color: bool,
     pub input_png: Option<String>,
     pub output_file: Option<String>,
     pub model_output_file: Option<String>,
@@ -55,6 +60,9 @@ impl Default for Config {
             no_svg: false,
             no_keyboard: false,
             no_draw_progress: false,
+            pen: "fineliner".to_string(),
+            no_select_pen: false,
+            no_color: false,
             input_png: None,
             output_file: None,
             model_output_file: None,
@@ -127,6 +135,9 @@ impl Config {
         // Validate trigger corner
         TriggerCorner::from_string(&self.trigger_corner)?;
 
+        // Validate the pen to draw with
+        DrawingPen::from_name(&self.pen)?;
+
         // Validate thinking tokens
         if self.thinking_tokens == 0 {
             return Err(anyhow::anyhow!("thinking_tokens must be greater than 0"));
@@ -138,6 +149,12 @@ impl Config {
     /// Check if test mode is enabled
     pub fn is_test_mode(&self) -> bool {
         self.test_mode.is_some()
+    }
+
+    /// Whether the model is to be told that it can draw in colour: on a Paper Pro, where
+    /// ghostwriter changes the pen's colour through the palette, unless that is turned off.
+    pub fn draws_in_colour(&self) -> bool {
+        !self.no_color && !self.no_select_pen && !self.no_draw && !self.is_test_mode() && DeviceModel::detect() == DeviceModel::RemarkablePaperPro
     }
 
     /// Get the test device model, or None if not in test mode

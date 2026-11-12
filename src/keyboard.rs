@@ -116,6 +116,9 @@ pub struct Keyboard {
     key_map: HashMap<char, (EvdevKey, bool)>,
     progress_count: u32,
     no_draw_progress: bool,
+    /// How long to wait after each key. xochitl on a Paper Pro (firmware 3.29) takes
+    /// every key at 7 ms apart and loses about one in twenty at 5 ms.
+    key_delay: time::Duration,
 }
 
 impl Keyboard {
@@ -127,7 +130,13 @@ impl Keyboard {
             key_map: Self::create_key_map(),
             progress_count: 0,
             no_draw_progress,
+            key_delay: time::Duration::from_millis(10),
         })
+    }
+
+    /// Change how long to wait after each key.
+    pub fn set_key_delay(&mut self, key_delay: time::Duration) {
+        self.key_delay = key_delay;
     }
 
     fn create_virtual_device() -> Result<VirtualDevice> {
@@ -219,7 +228,7 @@ impl Keyboard {
 
                 // Sync event
                 device.emit(&[InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0)])?;
-                thread::sleep(time::Duration::from_millis(10));
+                thread::sleep(self.key_delay);
             }
         }
         Ok(())
@@ -269,10 +278,8 @@ impl Keyboard {
         if self.no_draw_progress {
             return Ok(());
         }
-        // Send a backspace for each progress
-        for _ in 0..self.progress_count {
-            self.string_to_keypresses("\x08")?;
-        }
+        // Send a backspace for each character of the notes
+        self.string_to_keypresses(&"\x08".repeat(self.progress_count as usize))?;
         self.progress_count = 0;
         Ok(())
     }

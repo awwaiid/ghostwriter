@@ -77,6 +77,60 @@ pub fn thin_zhang_suen(grid: &mut [Vec<bool>]) {
     }
 }
 
+/// Apply Guo-Hall thinning in-place.
+/// `grid[row][col]` = true means ink pixel. The outermost rows and columns are left alone.
+///
+/// Unlike Zhang-Suen above, this keeps diagonal lines: Zhang-Suen thins a diagonal band
+/// to two pixels wide and then deletes it altogether.
+pub fn thin_guo_hall(grid: &mut [Vec<bool>]) {
+    let rows = grid.len();
+    if rows < 3 || grid[0].len() < 3 {
+        return;
+    }
+    let cols = grid[0].len();
+
+    loop {
+        let mut changed = false;
+
+        for pass in 0..2u8 {
+            let mut to_remove = Vec::new();
+
+            for r in 1..rows - 1 {
+                for c in 1..cols - 1 {
+                    if !grid[r][c] {
+                        continue;
+                    }
+
+                    let (p2, p3, p4) = (grid[r - 1][c], grid[r - 1][c + 1], grid[r][c + 1]);
+                    let (p5, p6, p7) = (grid[r + 1][c + 1], grid[r + 1][c], grid[r + 1][c - 1]);
+                    let (p8, p9) = (grid[r][c - 1], grid[r - 1][c - 1]);
+
+                    // How many separate groups of neighbours there are: removing a pixel
+                    // that joins two groups would break the line
+                    let groups = (!p2 && (p3 || p4)) as u8 + (!p4 && (p5 || p6)) as u8 + (!p6 && (p7 || p8)) as u8 + (!p8 && (p9 || p2)) as u8;
+                    let pairs_one = (p9 || p2) as u8 + (p3 || p4) as u8 + (p5 || p6) as u8 + (p7 || p8) as u8;
+                    let pairs_two = (p2 || p3) as u8 + (p4 || p5) as u8 + (p6 || p7) as u8 + (p8 || p9) as u8;
+                    let neighbours = pairs_one.min(pairs_two);
+                    let keeps_side = if pass == 0 { (p6 || p7 || !p9) && p8 } else { (p2 || p3 || !p5) && p4 };
+
+                    if groups == 1 && (2..=3).contains(&neighbours) && !keeps_side {
+                        to_remove.push((r, c));
+                    }
+                }
+            }
+
+            for (r, c) in to_remove {
+                grid[r][c] = false;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// Get 8-connected neighbors of pixel (r, c) that are set in `grid`.
 fn on_neighbors(grid: &[Vec<bool>], r: usize, c: usize) -> Vec<(usize, usize)> {
     let rows = grid.len();
@@ -221,4 +275,26 @@ pub fn trace_skeleton(grid: &[Vec<bool>]) -> Vec<Vec<(f32, f32)>> {
     }
 
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guo_hall_keeps_a_diagonal_band_as_one_line() {
+        // A band four cells wide, running down to the right
+        let mut grid = vec![vec![false; 24]; 24];
+        for step in 0..14 {
+            for offset in 0..4 {
+                grid[4 + step][3 + step + offset] = true;
+            }
+        }
+
+        thin_guo_hall(&mut grid);
+        let paths = trace_skeleton(&grid);
+
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].len() >= 10, "{paths:?}");
+    }
 }

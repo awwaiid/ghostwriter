@@ -13,15 +13,17 @@ use ghostwriter::{
     cancellation::GhostwriterCancellation,
     config::Config,
     coordinator::{self, CoordinatorChannels, ProgressState},
-    device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
-    embedded_assets::load_config,
+    device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
+    embedded_assets::{for_colour_display, load_config},
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
-    pen::Pen,
+    pen::{Drawing, DrawingPen, Pen},
+    screenshot::Screenshot,
     simulation::SimulationConfig,
     status::GhostwriterStatus,
-    touch::{PenTool, Touch, TriggerCorner},
-    util::{setup_uinput, svg_to_alpha_bitmap, svg_to_bitmap, write_bitmap_to_file, OptionMap},
+    stroke_plan::Ink,
+    touch::{PenRestore, PenSetup, Touch, TriggerCorner},
+    util::{setup_uinput, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
 };
 
@@ -91,6 +93,24 @@ pub struct Args {
     #[arg(long)]
     #[serde(skip_serializing_if = "is_false")]
     no_draw_progress: bool,
+
+    /// Sets the pen to draw with: fineliner (the second pen in the palette, thin)
+    /// or ballpoint (the first pen, medium) (default: fineliner)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pen: Option<String>,
+
+    /// Draw with whichever pen is selected, without opening the palette to select
+    /// and set up the one named by --pen. It should be that pen: if its first
+    /// stroke does not look like it, the pen is selected after all
+    #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
+    no_select_pen: bool,
+
+    /// Do not tell the model that it can draw in colour (reMarkable Paper Pro)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
+    no_color: bool,
 
     /// Input PNG file for testing
     #[arg(long)]
@@ -225,6 +245,7 @@ async fn main() -> Result<()> {
     }
 
     setup_uinput()?;
+    FullSpeed::release_any_left_held();
 
     ghostwriter(&args, config).await
 }
@@ -249,20 +270,111 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     Ok(())
 }
 
-fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool) -> Result<()> {
+/// How the draw_svg tool goes about drawing.
+#[derive(Clone)]
+struct SvgDrawing {
+    /// Save what is drawn as a bitmap in this file
+    save_bitmap: Option<String>,
+    /// Draw nothing
+    no_draw: bool,
+    /// There is no tablet: devices are simulated
+    test_mode: bool,
+    /// The pen to draw with
+    pen: DrawingPen,
+    /// Whether to select that pen first, or trust that it is selected already
+    select_pen: bool,
+}
+
+/// Select a pen in the palette. Uses a fresh Touch instance to avoid deadlock with
+/// trigger_task, which holds the shared touch RwLock indefinitely while waiting for
+/// the user's trigger.
+fn select_pen(setup: PenSetup) -> Result<PenRestore> {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_pen(setup).await }))
+}
+
+/// Change the colour of the pen that `select_pen` selected to the colour in `setup`.
+fn change_pen_colour(setup: PenSetup, restore: &mut PenRestore) -> Result<()> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            Touch::new(false, TriggerCorner::UpperRight)?
+                .change_pen_colour(setup, setup.colour, restore)
+                .await
+        })
+    })
+}
+
+fn restore_pen(setup: PenSetup, restore: PenRestore) -> Result<()> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.restore_pen(setup, restore).await })
+    })
+}
+
+/// Draw an SVG on the page.
+fn draw_svg(svg_data: &str, keyboard: &Mutex<Keyboard>, pen: &Mutex<Pen>, how: &SvgDrawing) -> Result<()> {
     info!("Drawing SVG to the screen.");
-    keyboard.progress_end()?;
+    lock!(keyboard).progress_end()?;
     let scale = 2u32;
-    if let Some(save_bitmap) = save_bitmap {
+    if let Some(save_bitmap) = &how.save_bitmap {
         let bitmap = svg_to_bitmap(svg_data, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
         write_bitmap_to_file(&bitmap, save_bitmap)?;
     }
-    if !no_draw {
-        // Use alpha-to-pressure rendering for best quality: anti-aliased edges via pen pressure
-        let alpha_bitmap = svg_to_alpha_bitmap(svg_data, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
-        pen.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)?;
+    if how.no_draw {
+        return Ok(());
     }
-    Ok(())
+    if how.test_mode {
+        return lock!(pen).draw_svg(svg_data, how.pen.model());
+    }
+    let device_model = lock!(pen).device_model();
+
+    // Taking the selected pen to be the right one is quickest, if its first stroke bears that out
+    let mut drawing = None;
+    if !how.select_pen {
+        let planned = Drawing::plan(svg_data, device_model, how.pen.model())?;
+        if lock!(pen).draw(&planned, true)? {
+            return Ok(());
+        }
+        info!("The selected pen does not draw like the {:?}, so selecting that", how.pen);
+        drawing = Some(planned);
+    }
+
+    // Select the pen, remembering what to put back. Meanwhile, work out how to draw the SVG.
+    let (selected, drawing) = std::thread::scope(|scope| {
+        let planning = scope.spawn(|| match drawing {
+            Some(planned) => Ok(planned),
+            None => Drawing::plan(svg_data, device_model, how.pen.model()),
+        });
+        // The pen starts out black; if the drawing turns out to start in another ink, that is changed below
+        let selected = select_pen(how.pen.setup(Ink::Black));
+        (
+            selected,
+            planning.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Planning the drawing failed"))),
+        )
+    });
+    let mut restore = selected.unwrap_or_else(|e| {
+        log::error!("Failed to select the pen: {}", e);
+        PenRestore::NOTHING
+    });
+
+    let drawn = drawing.and_then(|drawing| match &drawing {
+        // One ink at a time, changing the pen's colour in between
+        Drawing::Strokes { layers, pen: model } => {
+            let mut colour = Ink::Black;
+            for (ink, strokes) in layers {
+                if *ink != colour {
+                    change_pen_colour(how.pen.setup(*ink), &mut restore)?;
+                    colour = *ink;
+                }
+                lock!(pen).draw_planned_strokes(strokes, model, false)?;
+            }
+            Ok(())
+        }
+        Drawing::Rows { .. } => lock!(pen).draw(&drawing, false).map(|_| ()),
+    });
+
+    if let Err(e) = restore_pen(how.pen.setup(Ink::Black), restore) {
+        log::error!("Failed to put the pen back: {}", e);
+    }
+    drawn
 }
 
 fn determine_engine_name(engine_arg: &Option<String>, model: &str) -> Result<String> {
@@ -474,6 +586,11 @@ async fn run_ghostwriter_loop(
         tokio::spawn(async move { coordinator::progress_task(keyboard, progress_rx, cancellation).await })
     };
 
+    // While waiting for the first trigger, find the screen, so that the first screenshot is as quick as the rest
+    if !config.is_test_mode() && config.input_png.is_none() {
+        tokio::task::spawn_blocking(Screenshot::find_screen_ahead);
+    }
+
     // Main loop
     let mut trigger_rx = channels.trigger_rx;
     let progress_tx = channels.progress_tx.clone();
@@ -626,13 +743,21 @@ fn register_tools(
     // Register draw_svg tool
     if !config.no_svg {
         let output_file = config.output_file.clone();
-        let save_bitmap = config.save_bitmap.clone();
-        let no_draw = config.no_draw;
+        let how = SvgDrawing {
+            save_bitmap: config.save_bitmap.clone(),
+            no_draw: config.no_draw,
+            test_mode: config.is_test_mode(),
+            pen: DrawingPen::from_name(&config.pen)?,
+            select_pen: !config.no_select_pen,
+        };
         let keyboard_clone = Arc::clone(&keyboard);
         let pen_clone = Arc::clone(&pen);
-        let test_mode = config.is_test_mode();
 
-        let tool_config_draw_svg = load_config("tool_draw_svg.json")?;
+        let mut tool_config_draw_svg = load_config("tool_draw_svg.json")?;
+        if config.draws_in_colour() {
+            info!("Telling the model it can draw in colour");
+            tool_config_draw_svg = for_colour_display(&tool_config_draw_svg);
+        }
         engine.register_tool(
             "draw_svg",
             serde_json::from_str::<serde_json::Value>(tool_config_draw_svg.as_str())?,
@@ -649,33 +774,8 @@ fn register_tools(
                         log::error!("Failed to write output file: {}", e);
                     }
                 }
-
-                // Switch to fineliner before drawing, remember original tool for restore
-                // Use a fresh Touch instance to avoid deadlock with trigger_task which
-                // holds the shared touch RwLock indefinitely while waiting for user trigger
-                let previous_tool = if !no_draw && !test_mode {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_fineliner().await })
-                    })
-                    .unwrap_or(PenTool::Unknown)
-                } else {
-                    PenTool::Unknown
-                };
-
-                let mut keyboard = lock!(keyboard_clone);
-                let mut pen = lock!(pen_clone);
-                if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
+                if let Err(e) = draw_svg(svg_data, &keyboard_clone, &pen_clone, &how) {
                     log::error!("Failed to draw SVG: {}", e);
-                }
-                drop(keyboard);
-                drop(pen);
-
-                // Restore the original tool after drawing
-                if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.restore_tool(previous_tool).await })
-                    })
-                    .ok();
                 }
             }),
         );

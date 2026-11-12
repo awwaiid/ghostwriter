@@ -38,22 +38,30 @@ fn render_svg(svg_data: &str, width: u32, height: u32) -> Result<Pixmap> {
         }
     };
 
+    render_tree(&tree, width, height)
+}
+
+/// Render a parsed SVG scaled to fill a `width` x `height` pixmap.
+pub fn render_tree(tree: &Tree, width: u32, height: u32) -> Result<Pixmap> {
     let mut pixmap = Pixmap::new(width, height).with_context(|| format!("Invalid bitmap size {width}x{height}"))?;
     // Scale so the SVG fills the requested bitmap size (not just its intrinsic size)
     let svg_size = tree.size();
     let transform = usvg::Transform::from_scale(width as f32 / svg_size.width(), height as f32 / svg_size.height());
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    resvg::render(tree, transform, &mut pixmap.as_mut());
     Ok(pixmap)
 }
 
 /// Render an SVG to rows of alpha values (0-255).
 pub fn svg_to_alpha_bitmap(svg_data: &str, width: u32, height: u32) -> Result<Vec<Vec<u8>>> {
-    let pixmap = render_svg(svg_data, width, height)?;
-    Ok(pixmap
+    Ok(alpha_rows(&render_svg(svg_data, width, height)?))
+}
+
+fn alpha_rows(pixmap: &Pixmap) -> Vec<Vec<u8>> {
+    pixmap
         .pixels()
-        .chunks(width as usize)
+        .chunks(pixmap.width() as usize)
         .map(|row| row.iter().map(|p| p.alpha()).collect())
-        .collect())
+        .collect()
 }
 
 /// Render an SVG to rows of on/off pixels; a pixel is on when its alpha is above `threshold`.

@@ -1,17 +1,174 @@
 use anyhow::{Context, Result};
 use evdev::EventType as EvdevEventType;
 use evdev::{Device, InputEvent};
-use log::info;
+use log::{debug, info};
 use resvg::usvg;
+use std::sync::Mutex;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
-use crate::util::parse_svg;
+use crate::screenshot::{ScreenProbe, Screenshot};
+use crate::stroke_plan::{plan_drawing, watch_pixels, Ink, PenModel};
+use crate::touch::PenSetup;
+use crate::util::{parse_svg, svg_to_alpha_bitmap};
+
+/// One continuous pen stroke.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stroke {
+    /// Where the pen goes, in virtual page coordinates. Fractions are kept: the
+    /// digitizer is several times finer than the virtual page.
+    pub points: Vec<(f32, f32)>,
+    /// Pen pressure. `FULL_PRESSURE` is a firm stroke.
+    pub pressure: i32,
+}
+
+/// How quickly strokes are sent to the device.
+#[derive(Debug, Clone, Copy)]
+pub struct StrokeTiming {
+    /// Pause after the pen touches down, before it moves.
+    pub after_down: Duration,
+    /// Pause after the pen lifts, before the next stroke.
+    pub after_up: Duration,
+    /// Pause after every `points_per_pause` points along a stroke.
+    pub pause: Duration,
+    pub points_per_pause: usize,
+}
+
+impl StrokeTiming {
+    /// Under 1000 strokes a second, for when the screen cannot be watched to see how
+    /// the device is keeping up. A Paper Pro on firmware 3.29 draws about 2000 a second
+    /// and pauses now and then for tens of milliseconds, so this leaves it room: sent
+    /// more than it can take, strokes are lost and others run into each other.
+    pub fn unwatched() -> Self {
+        Self {
+            after_up: Duration::from_micros(900),
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for StrokeTiming {
+    /// About 2000 strokes a second, which is as fast as a Paper Pro on firmware 3.29
+    /// draws them when all is well.
+    fn default() -> Self {
+        Self {
+            after_down: Duration::ZERO,
+            after_up: Duration::from_micros(300),
+            pause: Duration::from_millis(1),
+            points_per_pause: 100,
+        }
+    }
+}
+
+/// The pressure of a firm stroke. (The digitizers report up to about 4096.)
+pub const FULL_PRESSURE: i32 = 2630;
+
+/// When any `Pen` in this process last lifted off the page, and how many strokes it
+/// had drawn since a touch was last taken.
+static LAST_LIFTED: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
+
+/// How much longer the tablet will go on ignoring touches because of the pen.
+///
+/// It ignores them while a pen is about, and for a little under a quarter of a second
+/// after it has gone (measured on a Paper Pro, firmware 3.29: a tap 220 ms after the
+/// pen is lost, one at 240 ms is taken). After a long drawing it takes longer to come
+/// round: with thousands of strokes behind it, a second or two.
+pub fn touch_ignored_for() -> Duration {
+    const AFTER_PEN: Duration = Duration::from_millis(300);
+    const FOR_EACH_STROKE: Duration = Duration::from_micros(400);
+    const AT_MOST: Duration = Duration::from_millis(2500);
+
+    match *LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        Some((lifted, strokes)) => (AFTER_PEN + FOR_EACH_STROKE * strokes as u32).min(AT_MOST).saturating_sub(lifted.elapsed()),
+        None => Duration::ZERO,
+    }
+}
+
+/// A touch has been taken, so the strokes drawn before it are done with.
+pub fn touch_was_taken() {
+    if let Some((_, strokes)) = LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
+        *strokes = 0;
+    }
+}
+
+/// The pens ghostwriter can draw with: the ones whose strokes have been measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DrawingPen {
+    /// The second pen in the palette, as a thin black fineliner
+    Fineliner,
+    /// The first pen in the palette, as a medium black ballpoint
+    Ballpoint,
+}
+
+impl DrawingPen {
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_lowercase().as_str() {
+            "fineliner" => Ok(Self::Fineliner),
+            "ballpoint" => Ok(Self::Ballpoint),
+            other => anyhow::bail!("Unknown pen {other}: use fineliner or ballpoint"),
+        }
+    }
+
+    /// How the pen's strokes come out, for planning a drawing.
+    pub fn model(self) -> PenModel {
+        match self {
+            Self::Fineliner => PenModel::FINELINER_THIN,
+            Self::Ballpoint => PenModel::BALLPOINT_MEDIUM,
+        }
+    }
+
+    /// How the pen is set up in the palette to draw in `ink`, for selecting it.
+    pub fn setup(self, ink: Ink) -> PenSetup {
+        let black = match self {
+            Self::Fineliner => PenSetup::FINELINER_THIN,
+            Self::Ballpoint => PenSetup::BALLPOINT_MEDIUM,
+        };
+        PenSetup {
+            colour: ink.palette_place(),
+            ..black
+        }
+    }
+}
+
+/// How an SVG is to be drawn on a device. Working it out takes a few tenths of a
+/// second, which can be spent while something else is going on.
+pub enum Drawing {
+    /// Strokes planned for a pen that has been measured on the Paper Pro: a page that
+    /// took half a minute takes a couple of seconds. They are grouped by the ink they
+    /// are to be drawn in, black first if there is any.
+    Strokes { layers: Vec<(Ink, Vec<Stroke>)>, pen: PenModel },
+    /// Row by row, with pen pressure standing in for anti-aliasing. Each row of the
+    /// page is `scale` rows of alpha values.
+    Rows { alpha: Vec<Vec<u8>>, scale: u32 },
+}
+
+impl Drawing {
+    /// Work out how to draw an SVG with `pen`, the pen that is selected on the device.
+    pub fn plan(svg_data: &str, device_model: DeviceModel, pen: PenModel) -> Result<Self> {
+        match device_model {
+            DeviceModel::RemarkablePaperPro => {
+                let started = Instant::now();
+                let layers = plan_drawing(svg_data, device_model.page_size(), &pen)?;
+                let strokes: usize = layers.iter().map(|layer| layer.1.len()).sum();
+                info!("Planned {} strokes in {} inks in {:?}", strokes, layers.len(), started.elapsed());
+                Ok(Self::Strokes { layers, pen })
+            }
+            _ => {
+                let scale = 2;
+                let alpha = svg_to_alpha_bitmap(svg_data, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
+                Ok(Self::Rows { alpha, scale })
+            }
+        }
+    }
+}
 
 pub struct Pen {
     device: Option<Device>,
     device_model: DeviceModel,
+    /// How far short of its last point each stroke gets an extra point, in device pixels,
+    /// for pens that only draw a stroke evenly when it has one (see `PenModel::tail`)
+    tail: f32,
 }
 
 impl Pen {
@@ -26,7 +183,11 @@ impl Pen {
             Some(Device::open(device_path).with_context(|| format!("Failed to open pen device {device_path}"))?)
         };
 
-        Ok(Self { device, device_model })
+        Ok(Self {
+            device,
+            device_model,
+            tail: 0.0,
+        })
     }
 
     pub fn draw_line_screen(&mut self, p1: (i32, i32), p2: (i32, i32)) -> Result<()> {
@@ -136,6 +297,9 @@ impl Pen {
                 InputEvent::new(EvdevEventType::KEY.0, 320, 0),           // BTN_TOOL_PEN
                 InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
             ])?;
+            let mut last_lifted = LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let strokes = last_lifted.map_or(0, |(_, strokes)| strokes);
+            *last_lifted = Some((Instant::now(), strokes + 1));
         }
         Ok(())
     }
@@ -526,9 +690,297 @@ impl Pen {
         self.draw_polylines(&polylines)
     }
 
+    pub fn device_model(&self) -> DeviceModel {
+        self.device_model
+    }
+
+    /// Draw an SVG on the page with `pen`, the pen that is selected on the device.
+    pub fn draw_svg(&mut self, svg_data: &str, pen: PenModel) -> Result<()> {
+        self.draw(&Drawing::plan(svg_data, self.device_model, pen)?, false)?;
+        Ok(())
+    }
+
+    /// Draw what was planned for an SVG, all of it with the pen as it is: whatever ink
+    /// each part was meant to be in, it comes out in the colour the pen is set to.
+    ///
+    /// With `check_pen`, the first stroke is drawn on its own and looked at. If it has
+    /// not come out the way the pen the drawing was planned for would draw it, nothing
+    /// more is drawn and this returns false: some other tool is selected. (Where the
+    /// screen cannot be watched there is no telling, and the whole drawing is drawn.)
+    pub fn draw(&mut self, drawing: &Drawing, check_pen: bool) -> Result<bool> {
+        match drawing {
+            Drawing::Strokes { layers, pen } => {
+                let strokes: Vec<Stroke> = layers.iter().flat_map(|(_, strokes)| strokes.iter().cloned()).collect();
+                self.draw_planned_strokes(&strokes, pen, check_pen)
+            }
+            Drawing::Rows { alpha, scale } => self.draw_bitmap_alpha_pressure(alpha, *scale).map(|()| true),
+        }
+    }
+
+    /// Draw strokes planned for `pen`, the pen that is selected on the device, watching
+    /// the screen if it can be watched. `check_pen` is as for `draw`.
+    pub fn draw_planned_strokes(&mut self, strokes: &[Stroke], pen: &PenModel, check_pen: bool) -> Result<bool> {
+        self.tail = pen.tail;
+        let drawn = match Screenshot::new().and_then(|mut screenshot| screenshot.probe()) {
+            Ok(screen) => self.draw_strokes_watched(strokes, &screen, pen, check_pen),
+            Err(e) => {
+                info!("Drawing without watching the screen: {}", e);
+                self.draw_strokes(strokes, &StrokeTiming::unwatched()).map(|()| true)
+            }
+        };
+        self.tail = 0.0;
+        drawn
+    }
+
+    /// Draw one stroke and see whether it came out the way `pen` draws: there at all, and
+    /// no wider. An eraser or the text tool leaves nothing; a marker or a highlighter
+    /// leaves too much.
+    fn first_stroke_is_as_planned(&mut self, stroke: &Stroke, watch: (u32, u32), screen: &ScreenProbe, pen: &PenModel) -> Result<bool> {
+        const PATIENCE: Duration = Duration::from_millis(400);
+
+        // Two pixels well clear of either side of the stroke's middle, which this pen leaves alone
+        let (width, height) = self.device_model.page_size();
+        let to_pixels = |(x, y): (f32, f32)| (x * width as f32 / VIRTUAL_WIDTH as f32, y * height as f32 / VIRTUAL_HEIGHT as f32);
+        let (from, to) = (to_pixels(stroke.points[0]), to_pixels(stroke.points[stroke.points.len() - 1]));
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = dx.hypot(dy).max(f32::MIN_POSITIVE);
+        let clear = pen.rows as f32 / 2.0 + 2.5;
+        let beside: Vec<(u32, u32)> = [clear, -clear]
+            .iter()
+            .map(|side| ((from.0 + to.0) / 2.0 + dy / length * side, (from.1 + to.1) / 2.0 - dx / length * side))
+            .filter(|&(x, y)| x >= 0.0 && y >= 0.0)
+            .map(|(x, y)| (x as u32, y as u32))
+            .filter(|&(x, y)| !screen.is_inked(x, y))
+            .collect();
+
+        self.draw_stroke(stroke, &StrokeTiming::default())?;
+        let drawn_at = Instant::now();
+        while !screen.is_inked(watch.0, watch.1) {
+            if drawn_at.elapsed() > PATIENCE {
+                info!("The first stroke left no ink");
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(1));
+        }
+        // The whole of the stroke is on the screen a moment after its middle
+        sleep(Duration::from_millis(5));
+        if beside.iter().any(|&(x, y)| screen.is_inked(x, y)) {
+            info!("The first stroke came out wider than the pen it was planned for");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Draw strokes as fast as the device takes them, watching the screen to see how far
+    /// it has got, and draw again any that did not arrive.
+    ///
+    /// The kernel holds 1024 pen events for xochitl to read, which is about 66 strokes.
+    /// xochitl draws some 2500 strokes a second, with pauses of tens of milliseconds. If
+    /// the events of a 67th stroke arrive before it has caught up, the kernel throws away
+    /// everything it was holding, and those strokes are never drawn. So strokes are only
+    /// sent a little way ahead of the last one seen on the screen.
+    ///
+    /// With `check_pen`, the first stroke is drawn alone and looked at first, and if it
+    /// is not what `pen` would have drawn the rest is left undrawn and this returns false.
+    pub fn draw_strokes_watched(&mut self, strokes: &[Stroke], screen: &ScreenProbe, pen: &PenModel, check_pen: bool) -> Result<bool> {
+        const ROUNDS: usize = 3;
+        const STRAGGLERS: Duration = Duration::from_millis(300);
+
+        let started = Instant::now();
+        // Ink that is already on the page says nothing about a new stroke
+        let watched: Vec<Option<(u32, u32)>> = watch_pixels(strokes, self.device_model.page_size(), pen)
+            .into_iter()
+            .map(|pixel| pixel.filter(|&(x, y)| !screen.is_inked(x, y)))
+            .collect();
+        let shows = |index: usize| watched[index].is_some_and(|(x, y)| screen.is_inked(x, y));
+
+        info!(
+            "Chose pixels to watch for {} of {} strokes in {:?}",
+            watched.iter().flatten().count(),
+            strokes.len(),
+            started.elapsed()
+        );
+
+        let mut to_draw: Vec<usize> = (0..strokes.len()).collect();
+        if check_pen {
+            // A stroke that can be watched, and is long enough to have a middle
+            let long_enough = |stroke: &Stroke| {
+                let (first, last) = (stroke.points[0], stroke.points[stroke.points.len() - 1]);
+                (first.0 - last.0).hypot(first.1 - last.1) >= 2.0
+            };
+            let first = (0..strokes.len()).find(|&index| watched[index].is_some() && long_enough(&strokes[index]));
+            let Some((first, watch)) = first.and_then(|first| Some((first, watched[first]?))) else {
+                info!("No stroke of this drawing would show whether the pen is the one it was planned for");
+                return Ok(false);
+            };
+            if !self.first_stroke_is_as_planned(&strokes[first], watch, screen, pen)? {
+                return Ok(false);
+            }
+            to_draw.retain(|&index| index != first);
+        }
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            if !self.send_watched(strokes, &to_draw, &watched, &shows)? {
+                // The screen is not showing what is drawn, so there is nothing to check
+                return Ok(true);
+            }
+            info!("Drew {} strokes in {:?}", to_draw.len(), started.elapsed());
+            to_draw.retain(|&index| watched[index].is_some() && !shows(index));
+            // Some strokes show a little after later ones do. Drawn again they would
+            // come out heavier, so give the stragglers a moment first.
+            let waiting_since = Instant::now();
+            while !to_draw.is_empty() && waiting_since.elapsed() < STRAGGLERS {
+                sleep(Duration::from_millis(20));
+                to_draw.retain(|&index| !shows(index));
+            }
+            if to_draw.is_empty() {
+                break;
+            }
+            info!("Drawing {} strokes again that did not arrive", to_draw.len());
+            for &index in to_draw.iter().take(12) {
+                debug!(
+                    "  stroke {} of {}: {:?}, watched at {:?}",
+                    index,
+                    strokes.len(),
+                    strokes[index].points,
+                    watched[index]
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Send the strokes listed in `order`, keeping no more than a window of them ahead of
+    /// what shows on the screen. Returns false if the screen stopped showing new strokes
+    /// part of the way through, after which the rest were sent at a steady pace.
+    fn send_watched(&mut self, strokes: &[Stroke], order: &[usize], watched: &[Option<(u32, u32)>], shows: &dyn Fn(usize) -> bool) -> Result<bool> {
+        // Strokes sent but not yet seen. At up to 16 events each they fit the kernel's
+        // queue with room to spare.
+        const WINDOW: usize = 48;
+        const POLL: Duration = Duration::from_micros(100);
+        // Strokes with nothing to watch for are given time instead, a little more than
+        // xochitl takes over a stroke
+        const UNWATCHED: Duration = Duration::from_micros(550);
+        // The longest pause seen in xochitl was 120 milliseconds
+        const STALLED: Duration = Duration::from_millis(500);
+        // How many times running a window of strokes may fail to show before giving up on the screen
+        const STALLS_ALLOWED: usize = 3;
+        const LAST_ONES: Duration = Duration::from_millis(300);
+
+        // order[..seen] have been read by xochitl
+        let mut seen = 0;
+        let mut stalls = 0;
+        let started = Instant::now();
+        for sent in 0..order.len() {
+            if sent % 500 == 0 {
+                debug!("{} strokes sent after {:?}", sent, started.elapsed());
+            }
+            let mut waiting_since: Option<Instant> = None;
+            while sent - seen >= WINDOW {
+                // Strokes are drawn in order, so the newest that shows accounts for all before it
+                if let Some(newest_showing) = (seen..sent).rev().find(|&at| shows(order[at])) {
+                    seen = newest_showing + 1;
+                    waiting_since = None;
+                    stalls = 0;
+                } else if !(seen..sent).any(|at| watched[order[at]].is_some()) {
+                    sleep(UNWATCHED);
+                    seen += 1;
+                } else if waiting_since.get_or_insert_with(Instant::now).elapsed() > STALLED {
+                    // Whatever became of those strokes, xochitl has had time to read them
+                    stalls += 1;
+                    if stalls >= STALLS_ALLOWED {
+                        info!("The screen is not showing the strokes being drawn; no longer watching it");
+                        let rest: Vec<Stroke> = order[sent..].iter().map(|&index| strokes[index].clone()).collect();
+                        self.draw_strokes(&rest, &StrokeTiming::unwatched())?;
+                        return Ok(false);
+                    }
+                    debug!("None of {} strokes showed; carrying on", sent - seen);
+                    seen = sent;
+                    waiting_since = None;
+                } else {
+                    sleep(POLL);
+                }
+            }
+            self.draw_stroke(
+                &strokes[order[sent]],
+                &StrokeTiming {
+                    after_up: Duration::ZERO,
+                    ..StrokeTiming::default()
+                },
+            )?;
+        }
+
+        // Give the last ones time to arrive
+        if let Some(last) = order.iter().rev().find(|&&index| watched[index].is_some()) {
+            let waiting_since = Instant::now();
+            while !shows(*last) && waiting_since.elapsed() < LAST_ONES {
+                sleep(POLL);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Draw strokes planned in virtual page coordinates, at a steady pace.
+    pub fn draw_strokes(&mut self, strokes: &[Stroke], timing: &StrokeTiming) -> Result<()> {
+        for stroke in strokes {
+            self.draw_stroke(stroke, timing)?;
+        }
+        Ok(())
+    }
+
+    fn draw_stroke(&mut self, stroke: &Stroke, timing: &StrokeTiming) -> Result<()> {
+        let Some(&first) = stroke.points.first() else {
+            return Ok(());
+        };
+        self.goto_xy_with_pressure(self.virtual_point_to_input(first), stroke.pressure)?;
+        sleep(timing.after_down);
+
+        for (index, &point) in stroke.points.iter().enumerate().skip(1) {
+            if index == stroke.points.len() - 1 {
+                if let Some(short_of_end) = self.point_before_end(stroke) {
+                    self.goto_xy(self.virtual_point_to_input(short_of_end))?;
+                }
+            }
+            self.goto_xy(self.virtual_point_to_input(point))?;
+            if timing.points_per_pause > 0 && index % timing.points_per_pause == 0 {
+                sleep(timing.pause);
+            }
+        }
+
+        self.pen_up()?;
+        sleep(timing.after_up);
+        Ok(())
+    }
+
+    /// The point a little short of the end of a stroke, for a pen that needs one there.
+    fn point_before_end(&self, stroke: &Stroke) -> Option<(f32, f32)> {
+        if self.tail <= 0.0 || stroke.points.len() < 2 {
+            return None;
+        }
+        let (last, before) = (stroke.points[stroke.points.len() - 1], stroke.points[stroke.points.len() - 2]);
+        // Device pixels are not quite square in virtual coordinates, but near enough for so short a step
+        let tail = self.tail * VIRTUAL_WIDTH as f32 / self.device_model.page_size().0 as f32;
+        let (dx, dy) = (last.0 - before.0, last.1 - before.1);
+        let length = dx.hypot(dy);
+        (length > tail * 2.0).then(|| (last.0 - dx / length * tail, last.1 - dy / length * tail))
+    }
+
+    /// Convert a fractional virtual page coordinate to pen digitizer coordinates.
+    fn virtual_point_to_input(&self, (x, y): (f32, f32)) -> (i32, i32) {
+        let (x_input, y_input) = self.page_to_input(x / VIRTUAL_WIDTH as f32, y / VIRTUAL_HEIGHT as f32);
+        (x_input.round() as i32, y_input.round() as i32)
+    }
+
     /// Convert a position on the page, as fractions of its width and height, to pen digitizer coordinates.
     fn page_to_input(&self, x_fraction: f32, y_fraction: f32) -> (f32, f32) {
         let (pen_width, pen_height) = self.device_model.pen_size();
+
+        // The digitizer's range does not always cover exactly the page
+        let (page_width, page_height) = self.device_model.page_size();
+        let (area_width, area_height) = self.device_model.pen_area_size();
+        let x_fraction = x_fraction * page_width as f32 / area_width as f32;
+        let y_fraction = y_fraction * page_height as f32 / area_height as f32;
+
         match self.device_model.input_orientation() {
             InputOrientation::Portrait => (x_fraction * pen_width as f32, y_fraction * pen_height as f32),
             // The digitizer is rotated: its x axis runs up the page and its y axis across it.
@@ -556,15 +1008,20 @@ mod tests {
     use super::*;
 
     fn pen(device_model: DeviceModel) -> Pen {
-        Pen { device: None, device_model }
+        Pen {
+            device: None,
+            device_model,
+            tail: 0.0,
+        }
     }
 
     #[test]
     fn paper_pro_maps_the_page_straight_onto_the_digitizer() {
         let pen = pen(DeviceModel::RemarkablePaperPro);
+        // The page is 1632x2154 pixels, of which the pen covers 1620x2160 from the top-left
         assert_eq!(pen.virtual_to_input((0, 0)), (0, 0));
-        assert_eq!(pen.virtual_to_input((384, 512)), (5590, 7670));
-        assert_eq!(pen.virtual_to_input((768, 1024)), (11180, 15340));
+        assert_eq!(pen.virtual_to_input((384, 512)), (5631, 7648));
+        assert_eq!(pen.virtual_to_input((768, 1024)), (11262, 15297));
     }
 
     #[test]

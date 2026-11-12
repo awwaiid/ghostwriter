@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 
 /// Every device is normalized to this virtual page size: screenshots are scaled to it
 /// before they go to the model, and the coordinates the model draws with are scaled
@@ -110,6 +111,28 @@ impl DeviceModel {
         }
     }
 
+    /// The (width, height) of the page in framebuffer pixels, the right way up.
+    pub fn page_size(&self) -> (u32, u32) {
+        match self {
+            DeviceModel::Remarkable2 | DeviceModel::Unknown => (1404, 1872),
+            _ => self.framebuffer_size(),
+        }
+    }
+
+    /// The (width, height), in framebuffer pixels, of the area the pen digitizer's range covers,
+    /// starting from the page's top-left corner.
+    ///
+    /// Usually that is the whole page. The Paper Pro's framebuffer has been 1632x2154 since
+    /// firmware 3.20, but its pen still spans the panel's own 1620x2160. Measured on
+    /// firmware 3.29 by drawing crosses and finding them in a capture: without this,
+    /// strokes land up to 10 pixels left and 6 pixels low of where they were aimed.
+    pub fn pen_area_size(&self) -> (u32, u32) {
+        match self {
+            DeviceModel::RemarkablePaperPro => (1620, 2160),
+            _ => self.page_size(),
+        }
+    }
+
     /// Framebuffer (width, height) in pixels, as stored in xochitl's memory.
     /// The reMarkable 2 stores it in landscape before firmware 3.24.
     pub fn framebuffer_size(&self) -> (u32, u32) {
@@ -119,6 +142,71 @@ impl DeviceModel {
             DeviceModel::RemarkablePaperPure => (1404, 1872),
             // The panel is 954 pixels wide; rows are padded to 960.
             DeviceModel::RemarkablePaperProMove => (960, 1696),
+        }
+    }
+}
+
+/// Keeps the tablet's memory running at full speed for as long as it is held.
+///
+/// The Paper Pro slows its memory bus down when little is going on, and whether the
+/// screen is busy decides that, not how hard a program is working. Caught in the slow
+/// mode, ghostwriter's own work takes about four times as long: 1.4 seconds for a
+/// screenshot instead of 0.4, a second to plan a drawing instead of a quarter of one.
+/// (Measured on firmware 3.29. The tablet spends about half its time in each mode.)
+///
+/// The kernel's bus frequency driver has a switch for this, which is turned off while
+/// any `FullSpeed` is held and back on when the last is dropped. On a device without
+/// the driver, holding one does nothing.
+pub struct FullSpeed {
+    switched: bool,
+}
+
+/// How many `FullSpeed`s are held that switched the slowing-down off.
+static FULL_SPEED_HOLDERS: Mutex<usize> = Mutex::new(0);
+
+impl FullSpeed {
+    pub fn hold() -> Self {
+        let mut holders = FULL_SPEED_HOLDERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let switched = *holders > 0 || Self::set_bus_scaling(false);
+        if switched {
+            *holders += 1;
+        }
+        Self { switched }
+    }
+
+    /// Let the tablet slow its memory down again, in case an earlier run of
+    /// ghostwriter was stopped while it held it at full speed.
+    pub fn release_any_left_held() {
+        Self::set_bus_scaling(true);
+    }
+
+    /// Turn the kernel's slowing-down of the memory bus on or off. Returns whether there was a switch to turn.
+    fn set_bus_scaling(enabled: bool) -> bool {
+        let Ok(devices) = std::fs::read_dir("/sys/bus/platform/drivers/imx_busfreq") else {
+            return false;
+        };
+        let value = if enabled { "1" } else { "0" };
+        // Every switch there is gets turned, not only the first that takes it
+        let mut turned = false;
+        for device in devices.flatten() {
+            let switch = device.path().join("enable");
+            if switch.exists() && std::fs::write(&switch, value).is_ok() {
+                turned = true;
+            }
+        }
+        turned
+    }
+}
+
+impl Drop for FullSpeed {
+    fn drop(&mut self) {
+        if !self.switched {
+            return;
+        }
+        let mut holders = FULL_SPEED_HOLDERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *holders = holders.saturating_sub(1);
+        if *holders == 0 {
+            Self::set_bus_scaling(true);
         }
     }
 }

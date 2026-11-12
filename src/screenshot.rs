@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::process;
+use std::sync::Mutex;
 
 use crate::device::{firmware_version, DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::simulation::{ScreenshotSimulator, SimulationConfig};
@@ -25,6 +26,49 @@ pub enum ScreenshotMode {
 
 pub struct Screenshot {
     mode: ScreenshotMode,
+}
+
+/// The xochitl process the screen buffer was last found in, and its address there.
+/// Finding it takes a quarter of a second, and it stays put for as long as xochitl runs.
+static SCREEN_BUFFER: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+/// Reads single pixels of the live screen, for watching ink arrive without capturing the lot.
+pub struct ScreenProbe {
+    memory: File,
+    address: u64,
+    width: u32,
+    height: u32,
+}
+
+impl ScreenProbe {
+    /// Whether the pixel at (x, y), in page pixels, is dark. Off the page, or unreadable, is not dark.
+    pub fn is_dark(&self, x: u32, y: u32) -> bool {
+        self.brightness(x, y).is_some_and(|brightness| brightness < 128)
+    }
+
+    /// Whether the pixel at (x, y) has any ink to speak of on it: it need not be dark,
+    /// only clearly not blank paper. The edge of a pen's line counts, and so does a
+    /// stroke that came out thinner than expected, and so does ink of any colour:
+    /// yellow is as bright as paper on the whole, but not in blue.
+    pub fn is_inked(&self, x: u32, y: u32) -> bool {
+        self.pixel(x, y).is_some_and(|[blue, green, red, _]| blue.min(green).min(red) < 200)
+    }
+
+    /// How bright the pixel at (x, y) is, from 0 for black to 255 for white. None off the page.
+    fn brightness(&self, x: u32, y: u32) -> Option<u32> {
+        self.pixel(x, y).map(|[blue, green, red, _]| (blue as u32 + green as u32 + red as u32) / 3)
+    }
+
+    /// The pixel at (x, y) as blue, green, red and alpha. None off the page, or if it cannot be read.
+    fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let mut pixel = [0u8; 4];
+        let offset = (y as u64 * self.width as u64 + x as u64) * 4;
+        self.memory.read_exact_at(&mut pixel, self.address + offset).ok()?;
+        Some(pixel)
+    }
 }
 
 impl Screenshot {
@@ -103,18 +147,11 @@ impl Screenshot {
             return Ok(());
         }
 
-        debug!("screenshot: finding pid");
-        let pid = Self::find_xochitl_pid()?;
-
-        debug!("screenshot: finding address");
-        let skip_bytes = self.find_framebuffer_address(&pid)?;
-
-        debug!("screenshot: reading data");
-        let framebuffer = self.read_framebuffer(&pid, skip_bytes)?;
-
-        debug!("screenshot: processing image");
-        let image = self.decode_framebuffer(framebuffer)?;
+        let started = std::time::Instant::now();
+        let image = self.capture_full_resolution()?;
+        debug!("Captured the screen in {:?}", started.elapsed());
         let (png, scaled) = Self::scale_and_encode(&image)?;
+        debug!("Scaled and encoded it after {:?}", started.elapsed());
 
         if let ScreenshotMode::Real { data, pixels, .. } = &mut self.mode {
             *data = png;
@@ -122,6 +159,62 @@ impl Screenshot {
         }
 
         Ok(())
+    }
+
+    /// Capture the screen at the device's own resolution, upright.
+    pub fn capture_full_resolution(&mut self) -> Result<DynamicImage> {
+        debug!("screenshot: finding the screen buffer");
+        let (pid, address) = self.locate_screen_buffer()?;
+
+        debug!("screenshot: reading data");
+        let started = std::time::Instant::now();
+        let framebuffer = self.read_framebuffer(&pid, address)?;
+
+        debug!("screenshot: processing image, after {:?} of reading", started.elapsed());
+        self.decode_framebuffer(framebuffer)
+    }
+
+    /// Find where the screen is in xochitl's memory now, so that the first screenshot
+    /// does not have to: it takes a quarter of a second, and is remembered.
+    pub fn find_screen_ahead() {
+        let found = Screenshot::new().and_then(|screenshot| screenshot.locate_screen_buffer());
+        if let Err(e) = found {
+            debug!("Could not find the screen ahead of time: {}", e);
+        }
+    }
+
+    /// A probe for reading single pixels of the live screen.
+    /// Only for screens stored upright with 4 bytes a pixel, which is the Paper Pro.
+    pub fn probe(&mut self) -> Result<ScreenProbe> {
+        anyhow::ensure!(
+            matches!(self.device_model(), DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure),
+            "Reading single pixels is only supported on the Paper Pro"
+        );
+        let (pid, address) = self.locate_screen_buffer()?;
+        Ok(ScreenProbe {
+            memory: File::open(format!("/proc/{}/mem", pid))?,
+            address,
+            width: self.screen_width(),
+            height: self.screen_height(),
+        })
+    }
+
+    /// The xochitl process, and the address of the screen buffer in its memory.
+    fn locate_screen_buffer(&self) -> Result<(String, u64)> {
+        let mut known = SCREEN_BUFFER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((pid, address)) = known.as_ref() {
+            let still_xochitl = std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|name| name.trim() == "xochitl");
+            let still_a_screen = File::open(format!("/proc/{pid}/mem")).is_ok_and(|memory| self.holds_opaque_pixels(&memory, *address));
+            if still_xochitl && still_a_screen {
+                return Ok((pid.clone(), *address));
+            }
+            debug!("The screen buffer is no longer where it was");
+        }
+
+        let pid = Self::find_xochitl_pid()?;
+        let address = self.find_framebuffer_address(&pid)?;
+        *known = Some((pid.clone(), address));
+        Ok((pid, address))
     }
 
     fn find_xochitl_pid() -> Result<String> {
@@ -332,9 +425,13 @@ impl Screenshot {
 
         match self.device_model() {
             DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
-                // 32-bit RGBA
-                debug!("Decoding {}x{} RGBA framebuffer", width, height);
-                Ok(RgbaImage::from_raw(width, height, raw_data).ok_or_else(invalid_size)?.into())
+                // 32-bit pixels, stored blue first
+                debug!("Decoding {}x{} BGRA framebuffer", width, height);
+                let mut pixels = raw_data;
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                Ok(RgbaImage::from_raw(width, height, pixels).ok_or_else(invalid_size)?.into())
             }
             DeviceModel::RemarkablePaperProMove => {
                 // 16 bits per pixel with the grey level in the low byte, already in portrait.
@@ -368,9 +465,12 @@ impl Screenshot {
     /// Scale an image to the virtual page size. Returns it as a PNG and as decoded pixels.
     fn scale_and_encode(image: &DynamicImage) -> Result<(Vec<u8>, RgbImage)> {
         debug!("Resizing image to {}x{}", VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
-        let scaled = image.resize_exact(VIRTUAL_WIDTH, VIRTUAL_HEIGHT, image::imageops::FilterType::Nearest);
+        // Averaging, not picking every other pixel: a pen line is only two pixels wide,
+        // and picking can miss it altogether
+        let started = std::time::Instant::now();
+        let scaled = image.thumbnail_exact(VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
 
-        debug!("Encoding resized image");
+        debug!("Encoding resized image, after {:?} of resizing", started.elapsed());
         let mut png_data = Vec::new();
         image::codecs::png::PngEncoder::new(&mut png_data).write_image(scaled.as_bytes(), VIRTUAL_WIDTH, VIRTUAL_HEIGHT, scaled.color().into())?;
 

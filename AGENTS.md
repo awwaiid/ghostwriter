@@ -20,7 +20,9 @@ Ghostwriter is a Vision-LLM agent for the reMarkable tablet that watches handwri
 - **Device Interaction** (`src/`):
   - `device.rs`: Device detection and every per-device value (input device paths, pen/touch ranges, framebuffer size, the virtual page size)
   - `screenshot.rs`: Screen capture by reading the framebuffer out of xochitl's memory
-  - `pen.rs`: SVG drawing and bitmap rendering to screen 
+  - `pen.rs`: Drawing on the page with simulated pen strokes, paced by watching the screen for each stroke's ink
+  - `stroke_plan.rs`: Turns an SVG into pen strokes for a pen whose strokes have been measured (`PenModel`)
+  - `path_strokes.rs`: The part of that plan that follows slanting and curving lines along their length
   - `keyboard.rs`: Virtual keyboard input via uinput
   - `touch.rs`: Touch event detection, simulated taps, and pen tool selection through the palette
 - **Image Processing**:
@@ -33,7 +35,8 @@ Ghostwriter is a Vision-LLM agent for the reMarkable tablet that watches handwri
 - **Off-device and experiments**:
   - `simulation/`: Scripted touches and canned screenshots for `--test-mode`
   - `web_server.rs`, `web/`: Optional configuration UI (`--web-server`)
-  - `bin/experiment.rs`: Command-line tool for trying pen and touch techniques on a Paper Pro
+  - `bin/experiment.rs`: Command-line tool for trying pen and touch techniques on a Paper Pro, and for measuring how a drawing came out
+  - `drawing_lab.rs`: Scoring a capture of the screen against the SVG it was meant to show, for `experiment`
 
 ## Common Development Commands
 
@@ -111,6 +114,16 @@ scp target/aarch64-unknown-linux-gnu/release/ghostwriter root@192.168.1.117:
 - Virtual display size is normalized to 768x1024 pixels
 - Screen capture reads the framebuffer out of xochitl's memory, and where it lives moves between firmware versions (the Paper Pro changed at 3.29); `screenshot.rs` documents each layout
 - Paper Pro Move support was contributed (PR #19) and has not been tested by the maintainer
+
+### Drawing on the Paper Pro
+- An SVG is drawn as straight two-point strokes: xochitl smooths anything with more points out of shape. Lines that slant or curve are followed along their length; everything else is filled with bars lined up with the pixel grid
+- Plans are made for a `PenModel`. Two pens have been measured (firmware 3.29): the thin fineliner (2 pixels wide) and the medium ballpoint (3 pixels wide, and it needs an extra point near the end of each stroke to draw evenly). `experiment bar-lengths` and `experiment pen-profile` are how to measure another
+- xochitl draws about 2000 strokes a second. The kernel queues 1024 pen events for it; if it falls a queue-full behind, the whole queue is dropped and strokes are lost or run into each other. So `Pen::draw_strokes_watched` reads pixels out of the screen buffer to see which strokes have arrived, and never sends more than a few dozen ahead
+- The tool palette is read off the screen too (`Palette` in `touch.rs`), so taps are confirmed rather than timed. Its positions are in screen pixels for firmware 3.29
+- Each colour in an SVG is drawn in the nearest of the pen's inks (`stroke_plan::Ink`), one ink at a time with the pen's colour changed in between, and what is white or pale is left as bare paper. The model is told it can use colour (`embedded_assets::for_colour_display`) unless `--no-color` or `--no-select-pen` is given
+- `device::FullSpeed` stops the kernel slowing the memory bus down while ghostwriter works, which otherwise makes screenshots and planning about four times slower
+- Other devices still draw row by row from a bitmap (`Pen::draw_bitmap_alpha_pressure`) and select the pen with timed taps: their pens have not been measured
+- `experiment draw-planned FILE.svg` draws the way ghostwriter does; `experiment score REFERENCE CAPTURE` puts a number on the result
 
 ### Environment Variables
 Set API keys for different LLM providers:
