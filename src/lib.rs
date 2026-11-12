@@ -2,6 +2,7 @@ pub mod cancellation;
 pub mod config;
 pub mod coordinator;
 pub mod device;
+pub mod drawing_lab;
 pub mod embedded_assets;
 pub mod keyboard;
 pub mod llm_engine;

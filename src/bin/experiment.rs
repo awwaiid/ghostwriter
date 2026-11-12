@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use evdev::{Device, EventType as EvdevEventType, InputEvent};
-use ghostwriter::device::{VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
-use ghostwriter::pen::Pen;
+use ghostwriter::device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
+use ghostwriter::drawing_lab;
+use ghostwriter::pen::{Pen, StrokeTiming};
 use ghostwriter::screenshot::Screenshot;
+use ghostwriter::stroke_plan::{plan_strokes, simulate};
 use ghostwriter::touch::{PenTool, Touch, TriggerCorner};
 use ghostwriter::util::{svg_to_alpha_bitmap, svg_to_bitmap, svg_to_bitmap_threshold};
 use std::thread::sleep as std_sleep;
@@ -97,6 +99,78 @@ enum Commands {
     DrawSvgScale3x { svg_string: String },
     /// Render an SVG string with configurable threshold + bidirectional scan
     DrawSvgThresholdBidi { svg_string: String, threshold: u8 },
+    /// Replay a stroke file on the device and report how long it took.
+    /// Each line is one stroke: its pressure, then its x,y points in virtual coordinates
+    Play {
+        strokes_path: String,
+        /// Microseconds to wait after the pen touches down
+        #[arg(long, default_value_t = 1000)]
+        after_down_us: u64,
+        /// Microseconds to wait after the pen lifts
+        #[arg(long, default_value_t = 1000)]
+        after_up_us: u64,
+        /// Microseconds to wait after every --points-per-pause points
+        #[arg(long, default_value_t = 1000)]
+        pause_us: u64,
+        #[arg(long, default_value_t = 100)]
+        points_per_pause: usize,
+        /// Select the fineliner first, and restore the previous tool afterwards
+        #[arg(long)]
+        select_tool: bool,
+    },
+    /// Capture the screen at the device's full resolution
+    ScreenshotFull { output_path: String },
+    /// Print the axis ranges the pen and touch devices report
+    AbsInfo,
+    /// Plan the strokes for an SVG file, write them as a stroke file, and report how
+    /// closely they should reproduce the SVG (runs anywhere)
+    Plan {
+        svg_path: String,
+        strokes_path: String,
+        /// The device's page size in pixels
+        #[arg(long, default_value = "1632x2154")]
+        page: String,
+        /// Plan one small mark per patch of ink instead of merging them into bars
+        #[arg(long)]
+        stipple: bool,
+    },
+    /// Draw an SVG file the way ghostwriter does: plan its strokes, draw them, and draw again any that did not arrive
+    DrawPlanned { svg_path: String },
+    /// Draw an SVG file's planned strokes without checking them, then report how many
+    /// have yet to show on the page as time passes
+    WatchArrival { svg_path: String },
+    /// Render where an SVG file puts ink, at the device's page size, to compare a capture with.
+    /// Run on the device this uses the device's own fonts
+    Render { svg_path: String, output_path: String },
+    /// Score a full-resolution capture against what was drawn: an SVG file, or an image from `render` (runs anywhere)
+    Score {
+        reference_path: String,
+        capture_path: String,
+        /// How far ink may be from where it belongs, in capture pixels
+        #[arg(long, default_value_t = 2)]
+        tolerance: u32,
+        /// Write a picture of the differences: red is stray ink, blue is missing ink
+        #[arg(long)]
+        diff: Option<String>,
+    },
+    /// List the dark runs along one column or row of an image (runs anywhere)
+    Profile {
+        image_path: String,
+        #[arg(long)]
+        col: Option<u32>,
+        #[arg(long)]
+        row: Option<u32>,
+    },
+    /// Save an enlarged crop of an image (runs anywhere)
+    Crop {
+        image_path: String,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        scale: u32,
+        output_path: String,
+    },
 }
 
 #[tokio::main]
@@ -362,12 +436,16 @@ async fn main() -> Result<()> {
         Commands::DrawSvgAlphaPressure { svg_string } => {
             let scale = 2u32;
             let alpha_bitmap = svg_to_alpha_bitmap(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
+            let mut elapsed = Duration::ZERO;
             with_fineliner(|| {
                 let mut pen = Pen::new(false)?;
-                pen.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)
+                let started = std::time::Instant::now();
+                pen.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)?;
+                elapsed = started.elapsed();
+                Ok(())
             })
             .await?;
-            println!("Drew SVG alpha-pressure ({} chars)", svg_string.len());
+            println!("Drew SVG alpha-pressure ({} chars) elapsed_ms={}", svg_string.len(), elapsed.as_millis());
         }
 
         Commands::DrawSvgThreshold { svg_string, threshold } => {
@@ -392,6 +470,189 @@ async fn main() -> Result<()> {
             println!("Drew SVG scale3x ({} chars)", svg_string.len());
         }
 
+        Commands::Play {
+            strokes_path,
+            after_down_us,
+            after_up_us,
+            pause_us,
+            points_per_pause,
+            select_tool,
+        } => {
+            let strokes = drawing_lab::read_strokes(&std::fs::read_to_string(&strokes_path)?)?;
+            let timing = StrokeTiming {
+                after_down: Duration::from_micros(after_down_us),
+                after_up: Duration::from_micros(after_up_us),
+                pause: Duration::from_micros(pause_us),
+                points_per_pause,
+            };
+            let mut elapsed = Duration::ZERO;
+            let mut draw = || {
+                let mut pen = Pen::new(false)?;
+                let started = std::time::Instant::now();
+                pen.draw_strokes(&strokes, &timing)?;
+                elapsed = started.elapsed();
+                Ok(())
+            };
+            if select_tool {
+                with_fineliner(draw).await?;
+            } else {
+                draw()?;
+            }
+            let points: usize = strokes.iter().map(|stroke| stroke.points.len()).sum();
+            println!("strokes={} points={} elapsed_ms={}", strokes.len(), points, elapsed.as_millis());
+        }
+
+        Commands::ScreenshotFull { output_path } => {
+            let image = Screenshot::new()?.capture_full_resolution()?;
+            image.to_luma8().save(&output_path)?;
+            println!("Full-resolution screenshot saved to {}", output_path);
+        }
+
+        Commands::AbsInfo => {
+            let device_model = DeviceModel::detect();
+            for (name, path) in [("pen", device_model.pen_device_path()), ("touch", device_model.touch_device_path())] {
+                println!("{} ({})", name, path);
+                for (axis, info) in Device::open(path)?.get_absinfo()? {
+                    println!("  {:?}: {}..{} resolution {}", axis, info.minimum(), info.maximum(), info.resolution());
+                }
+            }
+        }
+
+        Commands::Plan {
+            svg_path,
+            strokes_path,
+            page,
+            stipple,
+        } => {
+            let (width, height) = page.split_once('x').ok_or_else(|| anyhow::anyhow!("--page looks like 1632x2154"))?;
+            let page_size = (width.parse()?, height.parse()?);
+            let svg = std::fs::read_to_string(&svg_path)?;
+
+            let started = std::time::Instant::now();
+            let strokes = if stipple {
+                drawing_lab::plan_stipple(&svg, page_size)?
+            } else {
+                plan_strokes(&svg, page_size)?
+            };
+            let planning = started.elapsed();
+            std::fs::write(&strokes_path, drawing_lab::write_strokes(&strokes))?;
+
+            // How the plan compares with the SVG, by the pen model
+            let drawn = simulate(&strokes, page_size);
+            let wanted = svg_to_alpha_bitmap(&svg, page_size.0, page_size.1)?;
+            let (mut ink, mut missing, mut stray) = (0, 0, 0);
+            for (drawn_row, wanted_row) in drawn.iter().zip(&wanted) {
+                for (&is_drawn, &alpha) in drawn_row.iter().zip(wanted_row) {
+                    let is_wanted = alpha >= 128;
+                    ink += is_wanted as usize;
+                    missing += (is_wanted && !is_drawn) as usize;
+                    stray += (is_drawn && !is_wanted) as usize;
+                }
+            }
+            let points: usize = strokes.iter().map(|stroke| stroke.points.len()).sum();
+            println!(
+                "strokes={} points={} planning_ms={} ink_px={} missing_px={} stray_px={}",
+                strokes.len(),
+                points,
+                planning.as_millis(),
+                ink,
+                missing,
+                stray
+            );
+        }
+
+        Commands::DrawPlanned { svg_path } => {
+            let svg = std::fs::read_to_string(&svg_path)?;
+            with_fineliner(|| Pen::new(false)?.draw_svg(&svg)).await?;
+        }
+
+        Commands::WatchArrival { svg_path } => {
+            let svg = std::fs::read_to_string(&svg_path)?;
+            let strokes = plan_strokes(&svg, DeviceModel::detect().page_size())?;
+            let mut drawn_at = std::time::Instant::now();
+            with_fineliner(|| {
+                Pen::new(false)?.draw_strokes(&strokes, &StrokeTiming::default())?;
+                drawn_at = std::time::Instant::now();
+                Ok(())
+            })
+            .await?;
+
+            let mut screenshot = Screenshot::new()?;
+            for _ in 0..12 {
+                let capture = screenshot.capture_full_resolution()?.to_luma8();
+                let missing = ghostwriter::stroke_plan::missing_strokes(&strokes, &capture).len();
+                println!(
+                    "{}ms after drawing: {} of {} strokes missing",
+                    drawn_at.elapsed().as_millis(),
+                    missing,
+                    strokes.len()
+                );
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        Commands::Render { svg_path, output_path } => {
+            let (width, height) = DeviceModel::detect().page_size();
+            drawing_lab::render_ink(&std::fs::read_to_string(&svg_path)?, width, height)?.save(&output_path)?;
+            println!("Rendered {} at {}x{}", output_path, width, height);
+        }
+
+        Commands::Score {
+            reference_path,
+            capture_path,
+            tolerance,
+            diff,
+        } => {
+            let capture = image::open(&capture_path)?.to_luma8();
+            let wanted = if reference_path.ends_with(".svg") {
+                drawing_lab::wanted_ink(&std::fs::read_to_string(&reference_path)?, capture.width(), capture.height())?
+            } else {
+                drawing_lab::drawn_ink(&image::open(&reference_path)?.to_luma8())
+            };
+            let score = drawing_lab::score(&wanted, &capture, tolerance);
+            println!(
+                "f1={:.3} precision={:.3} recall={:.3} overlap={:.3} ink_ratio={:.2} shift=({},{}) overlap_at_shift={:.3}",
+                score.f1(),
+                score.precision,
+                score.recall,
+                score.overlap,
+                score.ink_ratio,
+                score.best_shift.0,
+                score.best_shift.1,
+                score.best_shift_overlap
+            );
+            if let Some(diff_path) = diff {
+                drawing_lab::difference_image(&wanted, &capture).save(&diff_path)?;
+            }
+        }
+
+        Commands::Profile { image_path, col, row } => {
+            let image = image::open(&image_path)?.to_luma8();
+            let runs = match (col, row) {
+                (Some(col), None) => drawing_lab::dark_runs((0..image.height()).map(|y| image.get_pixel(col, y)[0])),
+                (None, Some(row)) => drawing_lab::dark_runs((0..image.width()).map(|x| image.get_pixel(x, row)[0])),
+                _ => anyhow::bail!("Give exactly one of --col or --row"),
+            };
+            for (start, length) in runs {
+                println!("{} +{}", start, length);
+            }
+        }
+
+        Commands::Crop {
+            image_path,
+            x,
+            y,
+            width,
+            height,
+            scale,
+            output_path,
+        } => {
+            let crop = image::open(&image_path)?.crop_imm(x, y, width, height);
+            crop.resize_exact(width * scale, height * scale, image::imageops::FilterType::Nearest)
+                .save(&output_path)?;
+            println!("Saved {}", output_path);
+        }
+
         Commands::DrawSvgThresholdBidi { svg_string, threshold } => {
             let scale = 2u32;
             let bitmap = svg_to_bitmap_threshold(&svg_string, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale, threshold)?;
@@ -408,11 +669,14 @@ async fn main() -> Result<()> {
 }
 
 /// Switch to fineliner (with correct size/color settings), run drawing closure, then restore.
+/// Prints how long the drawing itself took.
 async fn with_fineliner<F: FnOnce() -> Result<()>>(f: F) -> Result<()> {
     let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
     let previous = touch.select_fineliner().await?;
     sleep(Duration::from_millis(500)).await; // Wait for palette close animation to finish
+    let started = std::time::Instant::now();
     let result = f();
+    println!("elapsed_ms={}", started.elapsed().as_millis());
     touch.restore_tool(previous).await?;
     result
 }
