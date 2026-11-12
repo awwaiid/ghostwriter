@@ -17,7 +17,7 @@ use ghostwriter::{
     embedded_assets::load_config,
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
-    pen::Pen,
+    pen::{Drawing, Pen},
     simulation::SimulationConfig,
     status::GhostwriterStatus,
     touch::{PenTool, Touch, TriggerCorner},
@@ -249,7 +249,8 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     Ok(())
 }
 
-fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool) -> Result<()> {
+/// Draw an SVG on the page. `drawing` is how to draw it, if that has been worked out already.
+fn draw_svg(svg_data: &str, drawing: Option<Drawing>, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool) -> Result<()> {
     info!("Drawing SVG to the screen.");
     keyboard.progress_end()?;
     let scale = 2u32;
@@ -258,7 +259,10 @@ fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap:
         write_bitmap_to_file(&bitmap, save_bitmap)?;
     }
     if !no_draw {
-        pen.draw_svg(svg_data)?;
+        match drawing {
+            Some(drawing) => pen.draw(&drawing)?,
+            None => pen.draw_svg(svg_data)?,
+        }
     }
     Ok(())
 }
@@ -648,21 +652,27 @@ fn register_tools(
                     }
                 }
 
-                // Switch to fineliner before drawing, remember original tool for restore
+                // Switch to fineliner before drawing, remember original tool for restore.
+                // Meanwhile, work out how to draw the SVG.
                 // Use a fresh Touch instance to avoid deadlock with trigger_task which
                 // holds the shared touch RwLock indefinitely while waiting for user trigger
-                let previous_tool = if !no_draw && !test_mode {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_fineliner().await })
+                let (previous_tool, drawing) = if !no_draw && !test_mode {
+                    let device_model = lock!(pen_clone).device_model();
+                    std::thread::scope(|scope| {
+                        let planning = scope.spawn(|| Drawing::plan(svg_data, device_model));
+                        let previous_tool = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_fineliner().await })
+                        })
+                        .unwrap_or(PenTool::Unknown);
+                        (previous_tool, planning.join().ok().and_then(Result::ok))
                     })
-                    .unwrap_or(PenTool::Unknown)
                 } else {
-                    PenTool::Unknown
+                    (PenTool::Unknown, None)
                 };
 
                 let mut keyboard = lock!(keyboard_clone);
                 let mut pen = lock!(pen_clone);
-                if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
+                if let Err(e) = draw_svg(svg_data, drawing, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
                     log::error!("Failed to draw SVG: {}", e);
                 }
                 drop(keyboard);

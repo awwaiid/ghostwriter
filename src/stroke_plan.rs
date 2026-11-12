@@ -4,21 +4,23 @@
 //! Paper Pro's thin fineliner (measured on firmware 3.29):
 //!
 //! - A stroke between two points is a straight line 2 pixels wide with round ends: it
-//!   inks every pixel whose centre is within a pixel of it.
+//!   inks every pixel whose centre is within a pixel of it. (Nearly. Seen from the pen
+//!   as it travels, the left side of the line starts and stops a pixel earlier than the
+//!   right side, so one corner pixel at each end comes out faint.)
 //! - Centred on the boundary between two pixel rows or columns the line is crisp.
 //!   Anywhere else it is anti-aliased.
 //! - A stroke has to move to leave ink; a single point draws nothing.
 //! - A stroke with more than two points is smoothed by the device, which rounds its
 //!   corners and pulls it off course, so every stroke here is just two points.
-//! - The device keeps up with about 2000 strokes a second, though now and then it stalls
-//!   and drops a burst of them (see `missing_strokes`).
+//! - The device draws about 2500 strokes a second, however few events each is made of.
+//!   Sent faster than it takes them, they are lost a queue-full at a time (see
+//!   `Pen::draw_strokes_watched`).
 //!
 //! So shapes are filled with crisp bars, each inking two rows or two columns of pixels,
 //! which reproduces the rendered SVG pixel for pixel. Lines too thin for a bar are drawn
 //! along their middle, the way a person would draw them.
 
 use anyhow::Result;
-use image::GrayImage;
 
 use crate::device::{VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::pen::{Stroke, FULL_PRESSURE};
@@ -394,71 +396,92 @@ fn simplify(path: &[Point], tolerance: f32) -> Vec<Point> {
     }
 }
 
-/// The strokes that left no ink on the page, going by a capture of it at the device's
-/// own resolution. The device drops strokes when it falls behind, a handful at a time.
-pub fn missing_strokes(strokes: &[Stroke], capture: &GrayImage) -> Vec<Stroke> {
-    let (width, height) = capture.dimensions();
-    let to_pixels = |(x, y): Point| (x * width as f32 / VIRTUAL_WIDTH as f32, y * height as f32 / VIRTUAL_HEIGHT as f32);
-    // A stroke runs along the boundary between two rows or columns of pixels, or through
-    // the middle of one, so look at the pixels either side of each point on it
-    let is_inked = |(x, y): Point| {
-        let (left, top) = ((x - 0.5).floor() as i64, (y - 0.5).floor() as i64);
-        (0..2).any(|dy| {
-            (0..2).any(|dx| {
-                let (x, y) = (left + dx, top + dy);
-                x >= 0 && y >= 0 && x < width as i64 && y < height as i64 && capture.get_pixel(x as u32, y as u32)[0] < 128
-            })
-        })
-    };
+/// For each stroke, a page pixel to watch for its ink arriving, in device pixels.
+///
+/// Where it can be, it is a pixel that no other stroke inks, so that it turning dark
+/// means this very stroke was drawn. Failing that it is one that no earlier stroke
+/// inks, which still shows the device has got this far. A stroke that only goes over
+/// earlier ink has none.
+///
+/// Only pixels beside the stroke's line, between its two ends, are used. The pixels
+/// around the ends are not inked evenly: the device draws the two sides of a stroke a
+/// pixel out of step with each other.
+pub fn watch_pixels(strokes: &[Stroke], page_size: (u32, u32)) -> Vec<Option<(u32, u32)>> {
+    let width = page_size.0 as usize;
+    let mut times_inked = vec![0u8; width * page_size.1 as usize];
+    for stroke in strokes {
+        for_each_inked_pixel(stroke, page_size, |x, y, _, _| {
+            let count = &mut times_inked[y * width + x];
+            *count = count.saturating_add(1);
+        });
+    }
 
+    let mut inked_before = vec![false; times_inked.len()];
     strokes
         .iter()
-        .filter(|stroke| {
-            let (Some(&first), Some(&last)) = (stroke.points.first(), stroke.points.last()) else {
-                return false;
-            };
-            let (from, to) = (to_pixels(first), to_pixels(last));
-            let length = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
-            let samples = ((length / 2.0).ceil() as usize).max(1);
-            let inked = (0..=samples)
-                .filter(|&sample| {
-                    let along = sample as f32 / samples as f32;
-                    is_inked((from.0 + (to.0 - from.0) * along, from.1 + (to.1 - from.1) * along))
-                })
-                .count();
-            inked * 2 < samples + 1
+        .map(|stroke| {
+            // The best pixel is this stroke's alone, and near its middle
+            let mut best = None;
+            let mut best_rank = (true, f32::INFINITY);
+            for_each_inked_pixel(stroke, page_size, |x, y, from_line, along| {
+                if inked_before[y * width + x] || from_line > 0.6 || along <= 0.0 || along >= 1.0 {
+                    return;
+                }
+                let rank = (times_inked[y * width + x] > 1, (along - 0.5).abs());
+                if rank < best_rank {
+                    best_rank = rank;
+                    best = Some((x as u32, y as u32));
+                }
+            });
+            for_each_inked_pixel(stroke, page_size, |x, y, _, _| inked_before[y * width + x] = true);
+
+            best
         })
-        .cloned()
         .collect()
 }
 
 /// The pixels a set of strokes would ink, as rows of true/false, by the pen model above.
 /// `strokes` are in virtual page coordinates, as `plan_strokes` returns them.
 pub fn simulate(strokes: &[Stroke], page_size: (u32, u32)) -> Vec<Vec<bool>> {
-    let (width, height) = (page_size.0 as usize, page_size.1 as usize);
-    let to_pixels = |(x, y): Point| (x * width as f32 / VIRTUAL_WIDTH as f32, y * height as f32 / VIRTUAL_HEIGHT as f32);
-
-    let mut rows = vec![vec![false; width]; height];
+    let mut rows = vec![vec![false; page_size.0 as usize]; page_size.1 as usize];
     for stroke in strokes {
-        for pair in stroke.points.windows(2) {
-            let (from, to) = (to_pixels(pair[0]), to_pixels(pair[1]));
-            if from == to {
-                continue;
-            }
-            let first_x = (from.0.min(to.0) - PEN_RADIUS).floor().max(0.0) as usize;
-            let last_x = ((from.0.max(to.0) + PEN_RADIUS).ceil() as usize).min(width.saturating_sub(1));
-            let first_y = (from.1.min(to.1) - PEN_RADIUS).floor().max(0.0) as usize;
-            let last_y = ((from.1.max(to.1) + PEN_RADIUS).ceil() as usize).min(height.saturating_sub(1));
-            for (y, row) in rows.iter_mut().enumerate().take(last_y + 1).skip(first_y) {
-                for (x, cell) in row.iter_mut().enumerate().take(last_x + 1).skip(first_x) {
-                    if distance_to_segment((x as f32 + 0.5, y as f32 + 0.5), from, to) <= PEN_RADIUS {
-                        *cell = true;
-                    }
+        for_each_inked_pixel(stroke, page_size, |x, y, _, _| rows[y][x] = true);
+    }
+    rows
+}
+
+/// A point in virtual page coordinates, in device pixels.
+fn to_pixels((x, y): Point, page_size: (u32, u32)) -> Point {
+    (x * page_size.0 as f32 / VIRTUAL_WIDTH as f32, y * page_size.1 as f32 / VIRTUAL_HEIGHT as f32)
+}
+
+/// Call `visit` with each pixel a stroke inks, by the pen model above: its x and y, how
+/// far its centre is from the stroke's line, and how far along the line it is (0 at the
+/// start, 1 at the end, beyond those around the ends). A pixel on two parts of a stroke
+/// is visited twice.
+fn for_each_inked_pixel(stroke: &Stroke, page_size: (u32, u32), mut visit: impl FnMut(usize, usize, f32, f32)) {
+    let (width, height) = (page_size.0 as usize, page_size.1 as usize);
+    for pair in stroke.points.windows(2) {
+        let (from, to) = (to_pixels(pair[0], page_size), to_pixels(pair[1], page_size));
+        if from == to {
+            continue;
+        }
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let first_x = (from.0.min(to.0) - PEN_RADIUS).floor().max(0.0) as usize;
+        let last_x = ((from.0.max(to.0) + PEN_RADIUS).ceil() as usize).min(width.saturating_sub(1));
+        let first_y = (from.1.min(to.1) - PEN_RADIUS).floor().max(0.0) as usize;
+        let last_y = ((from.1.max(to.1) + PEN_RADIUS).ceil() as usize).min(height.saturating_sub(1));
+        for y in first_y..=last_y {
+            for x in first_x..=last_x {
+                let centre = (x as f32 + 0.5, y as f32 + 0.5);
+                let from_line = distance_to_segment(centre, from, to);
+                if from_line <= PEN_RADIUS {
+                    let along = ((centre.0 - from.0) * dx + (centre.1 - from.1) * dy) / (dx * dx + dy * dy);
+                    visit(x, y, from_line, along);
                 }
             }
         }
     }
-    rows
 }
 
 fn distance_to_segment(point: Point, from: Point, to: Point) -> f32 {
@@ -566,20 +589,49 @@ mod tests {
     }
 
     #[test]
-    fn missing_strokes_are_the_ones_with_no_ink_under_them() {
+    fn a_watched_pixel_is_inked_by_its_stroke_and_by_none_before_it() {
         let page_size = (768, 1024);
-        let svg = r#"<svg width="768" height="1024" xmlns="http://www.w3.org/2000/svg"><rect x="100" y="100" width="60" height="40" fill="black"/></svg>"#;
+        let svg = r#"<svg width="768" height="1024" xmlns="http://www.w3.org/2000/svg"><rect x="100" y="100" width="60" height="40" fill="black"/><circle cx="300" cy="300" r="40" fill="black"/></svg>"#;
         let strokes = plan_strokes(svg, page_size).unwrap();
 
-        // A capture where every stroke arrived except the fifth and sixth
-        let mut arrived = strokes.clone();
-        let lost: Vec<Stroke> = arrived.drain(4..6).collect();
-        let inked = simulate(&arrived, page_size);
-        let capture = GrayImage::from_fn(page_size.0, page_size.1, |x, y| {
-            image::Luma([if inked[y as usize][x as usize] { 0 } else { 255 }])
-        });
+        let watched = watch_pixels(&strokes, page_size);
 
-        assert_eq!(missing_strokes(&strokes, &capture), lost);
+        assert_eq!(watched.len(), strokes.len());
+        let mut its_own = 0;
+        for (index, pixel) in watched.iter().enumerate() {
+            let Some((x, y)) = *pixel else {
+                continue;
+            };
+            let inks_it = |strokes: &[Stroke]| simulate(strokes, page_size)[y as usize][x as usize];
+            assert!(inks_it(&strokes[index..=index]), "stroke {index}");
+            assert!(!inks_it(&strokes[..index]), "stroke {index}");
+            its_own += !inks_it(&strokes[index + 1..]) as usize;
+        }
+        // Most strokes can be watched, and most of those by a pixel that no other stroke inks
+        let watchable = watched.iter().flatten().count();
+        assert!(watchable * 10 >= strokes.len() * 8, "{watchable} of {}", strokes.len());
+        assert!(its_own * 10 >= strokes.len() * 7, "{its_own} of {}", strokes.len());
+    }
+
+    #[test]
+    fn a_stroke_over_earlier_ink_has_nothing_to_watch() {
+        let stroke = |points: [Point; 2]| Stroke {
+            points: points.to_vec(),
+            pressure: FULL_PRESSURE,
+        };
+        let strokes = [
+            stroke([(10.0, 10.0), (30.0, 10.0)]),
+            // Along the first stroke, and then on past its end
+            stroke([(15.0, 10.0), (25.0, 10.0)]),
+            stroke([(20.0, 10.0), (40.0, 10.0)]),
+        ];
+
+        let watched = watch_pixels(&strokes, (768, 1024));
+
+        assert!(watched[0].is_some());
+        assert_eq!(watched[1], None);
+        // Only the part beyond the first stroke is new
+        assert!(watched[2].is_some_and(|(x, _)| (31..40).contains(&x)), "{watched:?}");
     }
 
     #[test]
