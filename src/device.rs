@@ -186,11 +186,15 @@ impl FullSpeed {
             return false;
         };
         let value = if enabled { "1" } else { "0" };
-        devices
-            .flatten()
-            .map(|device| device.path().join("enable"))
-            .filter(|switch| switch.exists())
-            .fold(false, |any, switch| std::fs::write(switch, value).is_ok() || any)
+        // Every switch there is gets turned, not only the first that takes it
+        let mut turned = false;
+        for device in devices.flatten() {
+            let switch = device.path().join("enable");
+            if switch.exists() && std::fs::write(&switch, value).is_ok() {
+                turned = true;
+            }
+        }
+        turned
     }
 }
 

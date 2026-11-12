@@ -1217,7 +1217,9 @@ async fn main() -> Result<()> {
                 }
             }
             let events: Vec<(u16, u16)> = bytes
-                .chunks_exact(EVENT_SIZE)
+                .as_chunks::<EVENT_SIZE>()
+                .0
+                .iter()
                 .map(|event| {
                     let fields = &event[EVENT_SIZE - 8..];
                     (u16::from_ne_bytes([fields[0], fields[1]]), u16::from_ne_bytes([fields[2], fields[3]]))
