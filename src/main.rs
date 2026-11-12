@@ -17,11 +17,12 @@ use ghostwriter::{
     embedded_assets::{for_colour_display, load_config},
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
+    partial::{drawable_so_far, string_property_so_far},
     pen::{Drawing, DrawingPen, Pen},
     screenshot::Screenshot,
     simulation::SimulationConfig,
     status::GhostwriterStatus,
-    stroke_plan::Ink,
+    stroke_plan::{DrawingInParts, Ink},
     touch::{PenRestore, PenSetup, Touch, TriggerCorner},
     util::{setup_uinput, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
@@ -111,6 +112,12 @@ pub struct Args {
     #[arg(long)]
     #[serde(skip_serializing_if = "is_false")]
     no_color: bool,
+
+    /// Take the model's response as it is written, and start drawing an SVG
+    /// while the rest of it is still arriving (Anthropic models, reMarkable Paper Pro)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
+    stream: bool,
 
     /// Input PNG file for testing
     #[arg(long)]
@@ -270,6 +277,47 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     Ok(())
 }
 
+/// Text typed a piece at a time, while the model is still writing it.
+struct LiveTyping {
+    keyboard: Arc<Mutex<Keyboard>>,
+    /// How many characters of the text have been typed
+    typed: usize,
+}
+
+impl LiveTyping {
+    /// More of the draw_text tool's arguments have arrived: type what is new of its text.
+    fn arguments_so_far(&mut self, arguments: &str) {
+        if let Some(text) = string_property_so_far(arguments, "text") {
+            if let Err(e) = self.type_up_to(&text) {
+                log::error!("Failed to type text: {}", e);
+            }
+        }
+    }
+
+    /// Type whatever of `text` has not been typed yet.
+    fn type_up_to(&mut self, text: &str) -> Result<()> {
+        let new: String = text.chars().skip(self.typed).collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        let mut keyboard = lock!(self.keyboard);
+        if self.typed == 0 {
+            info!("Typing text as it arrives.");
+            keyboard.progress_end()?;
+            keyboard.key_cmd_body()?;
+        }
+        self.typed += new.chars().count();
+        keyboard.string_to_keypresses(&new)
+    }
+
+    /// All of the text has arrived: type the last of it, and be ready for the next.
+    fn finish(&mut self, text: &str) -> Result<()> {
+        let typed = self.type_up_to(text);
+        self.typed = 0;
+        typed
+    }
+}
+
 /// How the draw_svg tool goes about drawing.
 #[derive(Clone)]
 struct SvgDrawing {
@@ -375,6 +423,127 @@ fn draw_svg(svg_data: &str, keyboard: &Mutex<Keyboard>, pen: &Mutex<Pen>, how: &
         log::error!("Failed to put the pen back: {}", e);
     }
     drawn
+}
+
+/// A drawing made a part at a time, while the model is still writing its SVG.
+///
+/// Each time more of the SVG has arrived, whatever its complete elements add to what
+/// has been drawn already is planned and drawn. The pen is selected before the first
+/// part and put back after the last.
+struct LiveDrawing {
+    how: SvgDrawing,
+    keyboard: Arc<Mutex<Keyboard>>,
+    pen: Arc<Mutex<Pen>>,
+    parts: DrawingInParts,
+    /// Whether any part has been drawn
+    begun: bool,
+    /// Whether the pen has been selected, or the selected pen seen to be the right one
+    pen_ready: bool,
+    /// What to put back at the end, if the pen was selected through the palette
+    restore: Option<PenRestore>,
+    /// The ink the pen is set to, when it is this that sets it
+    colour: Ink,
+    /// How long the drawable part of the SVG was when it was last drawn
+    drawn_up_to: usize,
+    /// Set if a part could not be drawn, after which the rest waits for the whole SVG
+    given_up: bool,
+}
+
+impl LiveDrawing {
+    fn new(how: SvgDrawing, keyboard: Arc<Mutex<Keyboard>>, pen: Arc<Mutex<Pen>>) -> Self {
+        let page_size = lock!(pen).device_model().page_size();
+        Self {
+            how,
+            keyboard,
+            pen,
+            parts: DrawingInParts::new(page_size),
+            begun: false,
+            pen_ready: false,
+            restore: None,
+            colour: Ink::Black,
+            drawn_up_to: 0,
+            given_up: false,
+        }
+    }
+
+    /// More of the draw_svg tool's arguments have arrived: draw what is newly complete in them.
+    fn arguments_so_far(&mut self, arguments: &str) {
+        if self.given_up {
+            return;
+        }
+        let Some(drawable) = string_property_so_far(arguments, "svg").and_then(|svg| drawable_so_far(&svg)) else {
+            return;
+        };
+        // Nothing new is complete, or what there is cannot be read as an SVG yet
+        if drawable.len() <= self.drawn_up_to || ghostwriter::util::parse_svg(&drawable).is_err() {
+            return;
+        }
+        self.drawn_up_to = drawable.len();
+        if let Err(e) = self.draw_more(&drawable) {
+            log::error!("Failed to draw part of the SVG: {}; leaving the rest until it has all arrived", e);
+            self.given_up = true;
+        }
+    }
+
+    /// Draw whatever `svg_data`, the SVG so far, adds to what has been drawn.
+    fn draw_more(&mut self, svg_data: &str) -> Result<()> {
+        let model = self.how.pen.model();
+        if !self.begun {
+            self.begun = true;
+            lock!(self.keyboard).progress_end()?;
+            if self.how.select_pen {
+                self.select_pen();
+            }
+        }
+
+        for (ink, strokes) in self.parts.plan_more(svg_data, &model)? {
+            // Without the palette, the first stroke shows whether the selected pen is the right one
+            if !self.pen_ready {
+                self.pen_ready = true;
+                if lock!(self.pen).draw_planned_strokes(&strokes, &model, true)? {
+                    continue;
+                }
+                info!("The selected pen does not draw like the {:?}, so selecting that", self.how.pen);
+                self.select_pen();
+            }
+            if let Some(restore) = self.restore.as_mut().filter(|_| ink != self.colour) {
+                change_pen_colour(self.how.pen.setup(ink), restore)?;
+                self.colour = ink;
+            }
+            lock!(self.pen).draw_planned_strokes(&strokes, &model, false)?;
+        }
+        Ok(())
+    }
+
+    fn select_pen(&mut self) {
+        self.restore = Some(select_pen(self.how.pen.setup(Ink::Black)).unwrap_or_else(|e| {
+            log::error!("Failed to select the pen: {}", e);
+            PenRestore::NOTHING
+        }));
+        self.colour = Ink::Black;
+        self.pen_ready = true;
+    }
+
+    /// The whole SVG has arrived: draw what is left of it, and put the pen back.
+    fn finish(&mut self, svg_data: &str) -> Result<()> {
+        if let Some(save_bitmap) = &self.how.save_bitmap {
+            let bitmap = svg_to_bitmap(svg_data, VIRTUAL_WIDTH * 2, VIRTUAL_HEIGHT * 2)?;
+            write_bitmap_to_file(&bitmap, save_bitmap)?;
+        }
+        let drawn = self.draw_more(svg_data);
+        self.wind_up();
+        drawn
+    }
+
+    /// Put the pen back, and be ready for the next drawing.
+    fn wind_up(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            if let Err(e) = restore_pen(self.how.pen.setup(Ink::Black), restore) {
+                log::error!("Failed to put the pen back: {}", e);
+            }
+        }
+        *self = Self::new(self.how.clone(), Arc::clone(&self.keyboard), Arc::clone(&self.pen));
+    }
 }
 
 fn determine_engine_name(engine_arg: &Option<String>, model: &str) -> Result<String> {
@@ -558,6 +727,9 @@ async fn run_ghostwriter_loop(
     if config.web_search {
         engine_options.insert("web_search".to_string(), "true".to_string());
     }
+    if config.stream {
+        engine_options.insert("stream".to_string(), "true".to_string());
+    }
     if config.thinking {
         engine_options.insert("thinking".to_string(), "true".to_string());
         engine_options.insert("thinking_tokens".to_string(), config.thinking_tokens.to_string());
@@ -715,6 +887,15 @@ fn register_tools(
     let no_draw = config.no_draw;
     let keyboard_clone = Arc::clone(&keyboard);
 
+    // With a streamed response, the text is typed as the model writes it
+    let live = (config.stream && !no_draw).then(|| {
+        Arc::new(Mutex::new(LiveTyping {
+            keyboard: Arc::clone(&keyboard),
+            typed: 0,
+        }))
+    });
+    let live_clone = live.clone();
+
     let tool_config_draw_text = load_config("tool_draw_text.json")?;
     engine.register_tool(
         "draw_text",
@@ -733,12 +914,27 @@ fn register_tools(
                 }
             }
             if !no_draw {
-                if let Err(e) = draw_text(text, &mut lock!(keyboard_clone)) {
+                // What is left of text that was typed as it arrived, or else all of it
+                let typed = match &live_clone {
+                    Some(live) => lock!(live).finish(text),
+                    None => draw_text(text, &mut lock!(keyboard_clone)),
+                };
+                if let Err(e) = typed {
                     log::error!("Failed to draw text: {}", e);
                 }
             }
         }),
     );
+    if let Some(live) = live {
+        engine.watch_tool_arguments(
+            "draw_text",
+            Box::new(move |arguments: Option<&str>| match arguments {
+                Some(arguments) => lock!(live).arguments_so_far(arguments),
+                // The response ended early: what was typed stays, and the next text starts afresh
+                None => lock!(live).typed = 0,
+            }),
+        );
+    }
 
     // Register draw_svg tool
     if !config.no_svg {
@@ -758,14 +954,24 @@ fn register_tools(
             info!("Telling the model it can draw in colour");
             tool_config_draw_svg = for_colour_display(&tool_config_draw_svg);
         }
+        // With a streamed response, on a tablet that draws in strokes, the drawing is
+        // begun while the model is still writing it
+        let live = (config.stream && !how.no_draw && !how.test_mode && lock!(pen).device_model() == DeviceModel::RemarkablePaperPro)
+            .then(|| Arc::new(Mutex::new(LiveDrawing::new(how.clone(), Arc::clone(&keyboard), Arc::clone(&pen)))));
+        let live_clone = live.clone();
+
         engine.register_tool(
             "draw_svg",
             serde_json::from_str::<serde_json::Value>(tool_config_draw_svg.as_str())?,
             Box::new(move |arguments: json| {
+                let mut live = live_clone.as_ref().map(|live| lock!(live));
                 let svg_data = match arguments["svg"].as_str() {
                     Some(svg) => svg,
                     None => {
                         log::error!("draw_svg tool called without valid 'svg' argument");
+                        if let Some(live) = live.as_mut() {
+                            live.wind_up();
+                        }
                         return;
                     }
                 };
@@ -774,11 +980,26 @@ fn register_tools(
                         log::error!("Failed to write output file: {}", e);
                     }
                 }
-                if let Err(e) = draw_svg(svg_data, &keyboard_clone, &pen_clone, &how) {
+                // What is left of a drawing that was begun as it arrived, or else the whole of it
+                let drawn = match live.as_mut().filter(|live| live.begun) {
+                    Some(live) => live.finish(svg_data),
+                    None => draw_svg(svg_data, &keyboard_clone, &pen_clone, &how),
+                };
+                if let Err(e) = drawn {
                     log::error!("Failed to draw SVG: {}", e);
                 }
             }),
         );
+        if let Some(live) = live {
+            engine.watch_tool_arguments(
+                "draw_svg",
+                Box::new(move |arguments: Option<&str>| match arguments {
+                    Some(arguments) => lock!(live).arguments_so_far(arguments),
+                    // The response ended without the drawing being finished
+                    None => lock!(live).wind_up(),
+                }),
+            );
+        }
     }
 
     Ok(())
