@@ -320,89 +320,132 @@ pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
 /// those for each ink the drawing calls for, black first. Each colour in the SVG is
 /// drawn in the ink nearest to it, and what is white or pale is left as bare paper.
 pub fn plan_drawing(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Result<Vec<(Ink, Vec<Stroke>)>> {
-    let (width, height) = (page_size.0 as usize, page_size.1 as usize);
-    let started = std::time::Instant::now();
-    // An SVG that cannot be read is drawn as a marker saying so, in black, which has no lines to follow
-    let parsed = parse_svg(svg_data);
-    debug!("Parsed the SVG after {:?}", started.elapsed());
-    let (inks, mut lines): (Vec<Option<Ink>>, Vec<(Ink, Segment)>) = match parsed {
-        Ok(tree) => {
-            let rendered = render_tree(&tree, page_size.0, page_size.1)?;
-            debug!("Rendered it after {:?}", started.elapsed());
-            let inks = rendered
-                .pixels()
-                .iter()
-                .map(|pixel| {
-                    // Most of a page is blank, and most of the rest is black: neither needs
-                    // working out. Nor does a solid colour need its transparency undone.
-                    if pixel.alpha() < 128 {
-                        None
-                    } else if pixel.alpha() == 255 && pixel.red() == 0 && pixel.green() == 0 && pixel.blue() == 0 {
-                        Some(Ink::Black)
-                    } else if pixel.alpha() == 255 {
-                        Ink::nearest(pixel.red(), pixel.green(), pixel.blue())
-                    } else {
-                        let colour = pixel.demultiply();
-                        Ink::nearest(colour.red(), colour.green(), colour.blue())
-                    }
-                })
-                .collect();
-            (inks, path_strokes::along_paths(&tree, page_size, pen))
-        }
-        Err(_) => {
-            let coverage = svg_to_alpha_bitmap(svg_data, page_size.0, page_size.1)?;
-            let inks = coverage.iter().flatten().map(|&alpha| (alpha >= 128).then_some(Ink::Black)).collect();
-            (inks, Vec::new())
-        }
-    };
-    debug!("Followed its lines after {:?}", started.elapsed());
+    DrawingInParts::new(page_size).plan_more(svg_data, pen)
+}
 
-    // A line is only followed where it shows: not where something else is drawn over it
-    let ink_at = |(x, y): Point| {
-        let (x, y) = (x.floor(), y.floor());
-        (x >= 0.0 && y >= 0.0 && (x as usize) < width && (y as usize) < height)
-            .then(|| inks[y as usize * width + x as usize])
-            .flatten()
-    };
-    lines.retain(|&(ink, (from, to))| ink_at(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0)) == Some(ink));
+/// A drawing that is planned a part at a time, as its SVG arrives: first what the
+/// first few elements call for, then what a longer run of them adds to that, and so
+/// on until the whole SVG has been planned.
+pub struct DrawingInParts {
+    page_size: (u32, u32),
+    /// The pixels that the parts planned so far had ink on. Empty before the first part.
+    planned: Vec<bool>,
+}
 
-    let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
-    // Where on the page each ink is called for, as the edges of the box around it:
-    // left, top, right and bottom. Usually it is a small part of the page.
-    let mut called_for: [Option<(usize, usize, usize, usize)>; Ink::ALL.len()] = [None; Ink::ALL.len()];
-    for (index, ink) in inks.iter().enumerate().filter_map(|(index, ink)| Some((index, (*ink)?))) {
-        let (x, y) = (index % width, index / width);
-        let (left, top, right, bottom) = called_for[ink as usize].unwrap_or((x, y, x, y));
-        called_for[ink as usize] = Some((left.min(x), top.min(y), right.max(x), bottom.max(y)));
-    }
-
-    let mut layers = Vec::new();
-    for ink in Ink::ALL {
-        let Some((left, top, right, bottom)) = called_for[ink as usize] else {
-            continue;
-        };
-        let of_this_ink = Grid {
-            width: right - left + 1,
-            height: bottom - top + 1,
-            cells: (top..=bottom)
-                .flat_map(|y| inks[y * width + left..=y * width + right].iter().map(|&at| at == Some(ink)))
-                .collect(),
-        };
-        let lines: Vec<Segment> = lines.iter().filter(|line| line.0 == ink).map(|line| line.1).collect();
-        let strokes = plan_one_ink(&of_this_ink, (left, top), lines, page_size, pen);
-        if !strokes.is_empty() {
-            debug!("{} strokes in {:?}, after {:?}", strokes.len(), ink, started.elapsed());
-            let strokes = strokes
-                .into_iter()
-                .map(|(from, to)| Stroke {
-                    points: vec![to_virtual(from), to_virtual(to)],
-                    pressure: FULL_PRESSURE,
-                })
-                .collect();
-            layers.push((ink, strokes));
+impl DrawingInParts {
+    pub fn new(page_size: (u32, u32)) -> Self {
+        Self {
+            page_size,
+            planned: Vec::new(),
         }
     }
-    Ok(layers)
+
+    /// Whether any part has been planned yet.
+    pub fn has_begun(&self) -> bool {
+        !self.planned.is_empty()
+    }
+
+    /// Plan the strokes for whatever `svg_data` has ink on that the parts planned
+    /// before it did not: those for each ink it calls for, black first. `svg_data` is
+    /// the whole SVG so far, not just what is new in it.
+    pub fn plan_more(&mut self, svg_data: &str, pen: &PenModel) -> Result<Vec<(Ink, Vec<Stroke>)>> {
+        let page_size = self.page_size;
+        let (width, height) = (page_size.0 as usize, page_size.1 as usize);
+        let started = std::time::Instant::now();
+        // An SVG that cannot be read is drawn as a marker saying so, in black, which has no lines to follow
+        let parsed = parse_svg(svg_data);
+        debug!("Parsed the SVG after {:?}", started.elapsed());
+        let (inks, mut lines): (Vec<Option<Ink>>, Vec<(Ink, Segment)>) = match parsed {
+            Ok(tree) => {
+                let rendered = render_tree(&tree, page_size.0, page_size.1)?;
+                debug!("Rendered it after {:?}", started.elapsed());
+                let inks = rendered
+                    .pixels()
+                    .iter()
+                    .map(|pixel| {
+                        // Most of a page is blank, and most of the rest is black: neither needs
+                        // working out. Nor does a solid colour need its transparency undone.
+                        if pixel.alpha() < 128 {
+                            None
+                        } else if pixel.alpha() == 255 && pixel.red() == 0 && pixel.green() == 0 && pixel.blue() == 0 {
+                            Some(Ink::Black)
+                        } else if pixel.alpha() == 255 {
+                            Ink::nearest(pixel.red(), pixel.green(), pixel.blue())
+                        } else {
+                            let colour = pixel.demultiply();
+                            Ink::nearest(colour.red(), colour.green(), colour.blue())
+                        }
+                    })
+                    .collect();
+                (inks, path_strokes::along_paths(&tree, page_size, pen))
+            }
+            Err(_) => {
+                let coverage = svg_to_alpha_bitmap(svg_data, page_size.0, page_size.1)?;
+                let inks = coverage.iter().flatten().map(|&alpha| (alpha >= 128).then_some(Ink::Black)).collect();
+                (inks, Vec::new())
+            }
+        };
+        debug!("Followed its lines after {:?}", started.elapsed());
+
+        // What earlier parts had ink on has been drawn, or was left out on purpose
+        let inks: Vec<Option<Ink>> = if self.planned.is_empty() {
+            self.planned = inks.iter().map(Option::is_some).collect();
+            inks
+        } else {
+            let new = inks.iter().zip(&self.planned).map(|(&ink, &planned)| ink.filter(|_| !planned)).collect();
+            for (planned, ink) in self.planned.iter_mut().zip(&inks) {
+                *planned |= ink.is_some();
+            }
+            new
+        };
+
+        // A line is only followed where it shows: not where something else is drawn over it
+        let ink_at = |(x, y): Point| {
+            let (x, y) = (x.floor(), y.floor());
+            (x >= 0.0 && y >= 0.0 && (x as usize) < width && (y as usize) < height)
+                .then(|| inks[y as usize * width + x as usize])
+                .flatten()
+        };
+        lines.retain(|&(ink, (from, to))| ink_at(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0)) == Some(ink));
+
+        let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
+        // Where on the page each ink is called for, as the edges of the box around it:
+        // left, top, right and bottom. Usually it is a small part of the page.
+        let mut called_for: [Option<(usize, usize, usize, usize)>; Ink::ALL.len()] = [None; Ink::ALL.len()];
+        for (index, ink) in inks.iter().enumerate().filter_map(|(index, ink)| Some((index, (*ink)?))) {
+            let (x, y) = (index % width, index / width);
+            let (left, top, right, bottom) = called_for[ink as usize].unwrap_or((x, y, x, y));
+            called_for[ink as usize] = Some((left.min(x), top.min(y), right.max(x), bottom.max(y)));
+        }
+
+        let mut layers = Vec::new();
+        for ink in Ink::ALL {
+            let Some((left, top, right, bottom)) = called_for[ink as usize] else {
+                continue;
+            };
+            let of_this_ink = Grid {
+                width: right - left + 1,
+                height: bottom - top + 1,
+                cells: (top..=bottom)
+                    .flat_map(|y| inks[y * width + left..=y * width + right].iter().map(|&at| at == Some(ink)))
+                    .collect(),
+            };
+            let lines: Vec<Segment> = lines.iter().filter(|line| line.0 == ink).map(|line| line.1).collect();
+            let strokes = plan_one_ink(&of_this_ink, (left, top), lines, page_size, pen);
+            if !strokes.is_empty() {
+                debug!("{} strokes in {:?}, after {:?}", strokes.len(), ink, started.elapsed());
+                let strokes = strokes
+                    .into_iter()
+                    .map(|(from, to)| Stroke {
+                        points: vec![to_virtual(from), to_virtual(to)],
+                        pressure: FULL_PRESSURE,
+                    })
+                    .collect();
+                layers.push((ink, strokes));
+            }
+        }
+        Ok(layers)
+    }
 }
 
 /// Plan the strokes for the part of a drawing that is in one ink. `ink` is the part of
@@ -1075,6 +1118,51 @@ mod tests {
         assert!(inked(Ink::Red, 330, 120) && !inked(Ink::Red, 130, 120));
         assert!(inked(Ink::Blue, 250, 400) && !inked(Ink::Blue, 250, 700));
         assert!(Ink::ALL.iter().all(|&ink| !layers.iter().any(|layer| layer.0 == ink) || !inked(ink, 20, 20)));
+    }
+
+    #[test]
+    fn a_drawing_planned_in_parts_adds_up_to_the_whole() {
+        let page_size = (768, 1024);
+        let svg = |elements: &[&str]| {
+            format!(
+                r#"<svg width="768" height="1024" xmlns="http://www.w3.org/2000/svg">{}</svg>"#,
+                elements.concat()
+            )
+        };
+        let elements = [
+            r#"<rect x="100" y="100" width="200" height="120" fill="black"/>"#,
+            r#"<line x1="100" y1="400" x2="500" y2="700" stroke="black" stroke-width="3"/>"#,
+            r#"<circle cx="500" cy="200" r="60" fill="none" stroke="red" stroke-width="3"/>"#,
+            // Over the block that is there already: only what sticks out is new
+            r#"<rect x="250" y="150" width="150" height="40" fill="black"/>"#,
+        ];
+        let flat = |layers: Vec<(Ink, Vec<Stroke>)>| layers.into_iter().flat_map(|layer| layer.1).collect::<Vec<_>>();
+
+        let mut parts = DrawingInParts::new(page_size);
+        let mut in_parts = Vec::new();
+        for upto in 1..=elements.len() {
+            let more = flat(parts.plan_more(&svg(&elements[..upto]), FINELINER).unwrap());
+            assert!(!more.is_empty(), "part {upto} adds nothing");
+            // Nothing in a later part goes over what an earlier part inked, give or take its edge
+            let (before, now) = (simulate(&in_parts, page_size, FINELINER), simulate(&more, page_size, FINELINER));
+            let again = before
+                .iter()
+                .flatten()
+                .zip(now.iter().flatten())
+                .filter(|(&before, &now)| before && now)
+                .count();
+            let new = now.iter().flatten().filter(|&&now| now).count();
+            assert!(again * 20 < new, "part {upto} inks {again} pixels again of {new}");
+            in_parts.extend(more);
+        }
+        // Planned again with nothing new, there is nothing to draw
+        assert!(flat(parts.plan_more(&svg(&elements), FINELINER).unwrap()).is_empty());
+
+        let all_at_once = flat(plan_drawing(&svg(&elements), page_size, FINELINER).unwrap());
+        let (parts_ink, whole_ink) = (simulate(&in_parts, page_size, FINELINER), simulate(&all_at_once, page_size, FINELINER));
+        let differing = parts_ink.iter().flatten().zip(whole_ink.iter().flatten()).filter(|(a, b)| a != b).count();
+        let total = whole_ink.iter().flatten().filter(|&&ink| ink).count();
+        assert!(differing * 50 < total, "{differing} of {total} pixels differ");
     }
 
     #[test]

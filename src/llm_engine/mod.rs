@@ -22,6 +22,12 @@ pub enum ModelExecutionStatus {
 pub type ToolCallback = Box<dyn FnMut(JsonValue) + Send>;
 pub type StatusCallback = Box<dyn FnMut(ModelExecutionStatus) + Send>;
 
+/// Called with a tool call's arguments while they are still arriving: the text so far
+/// of the JSON object they will be, each time there is more of it. Called with None if
+/// the response ends without the tool being run after all, so that anything begun on
+/// the strength of the partial arguments can be wound up.
+pub type PartialCallback = Box<dyn FnMut(Option<&str>) + Send>;
+
 /// The future returned by `LLMEngine::execute`, boxed so engines can be used as `dyn LLMEngine`.
 pub type ExecuteFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
@@ -30,6 +36,8 @@ pub struct Tool {
     /// The tool's name, description and parameter schema, as in `prompts/tool_*.json`
     pub definition: JsonValue,
     pub callback: ToolCallback,
+    /// Told of the tool's arguments as they arrive, by an engine that streams its response
+    pub partial: Option<PartialCallback>,
 }
 
 pub trait LLMEngine: Send {
@@ -37,6 +45,9 @@ pub trait LLMEngine: Send {
     where
         Self: Sized;
     fn register_tool(&mut self, name: &str, definition: JsonValue, callback: ToolCallback);
+    /// Ask to be told of a registered tool's arguments while they are still arriving.
+    /// An engine that does not stream its responses never calls `callback`.
+    fn watch_tool_arguments(&mut self, _name: &str, _callback: PartialCallback) {}
     fn add_text_content(&mut self, text: &str);
     fn add_image_content(&mut self, base64_image: &str);
     fn clear_content(&mut self);
@@ -63,6 +74,45 @@ async fn post_json(request: reqwest::RequestBuilder, body: &JsonValue, cancellat
     };
 
     with_cancellation(request_future, cancellation).await
+}
+
+/// Splits a stream of server-sent events into the data of each event.
+#[derive(Default)]
+struct ServerSentEvents {
+    /// What has arrived of an event that is not yet complete
+    unfinished: Vec<u8>,
+}
+
+impl ServerSentEvents {
+    /// Take some more of the stream, and return the data of each event it completes.
+    /// The stream can be cut anywhere, including in the middle of a character.
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.unfinished.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        // An event ends at a blank line
+        while let Some((end, gap)) = [&b"\n\n"[..], &b"\r\n\r\n"[..]]
+            .iter()
+            .filter_map(|blank| {
+                self.unfinished
+                    .windows(blank.len())
+                    .position(|window| window == *blank)
+                    .map(|at| (at, blank.len()))
+            })
+            .min()
+        {
+            let event: Vec<u8> = self.unfinished.drain(..end + gap).collect();
+            let text = String::from_utf8_lossy(&event[..end]);
+            let data: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|data| data.strip_prefix(' ').unwrap_or(data))
+                .collect();
+            if !data.is_empty() {
+                events.push(data.join("\n"));
+            }
+        }
+        events
+    }
 }
 
 /// Run the registered tool `name` with the arguments the model gave for it.
@@ -101,6 +151,20 @@ mod tests {
             name: name.to_string(),
             definition: json!({}),
             callback: Box::new(move |arguments| calls.lock().unwrap().push(arguments)),
+            partial: None,
+        }
+    }
+
+    #[test]
+    fn server_sent_events_are_put_back_together_however_the_stream_is_cut() {
+        let stream = "event: ping\ndata: {\"type\": \"ping\"}\n\nevent: content_block_delta\r\ndata: {\"text\": \"caf\u{e9}\"}\r\n\r\n: a comment\n\ndata: one\ndata: two\n\ndata: unfinished";
+        let expected = vec!["{\"type\": \"ping\"}", "{\"text\": \"caf\u{e9}\"}", "one\ntwo"];
+
+        // All at once, a byte at a time, and in pieces of every size between
+        for size in 1..=stream.len() {
+            let mut events = ServerSentEvents::default();
+            let data: Vec<String> = stream.as_bytes().chunks(size).flat_map(|piece| events.push(piece)).collect();
+            assert_eq!(data, expected, "in pieces of {size}");
         }
     }
 

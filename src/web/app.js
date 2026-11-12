@@ -92,7 +92,7 @@ class GhostwriterConfig {
 
         // Checkboxes
         const boolFields = [
-            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress', 'no_select_pen', 'no_color',
+            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress', 'no_select_pen', 'no_color', 'stream',
             'no_loop', 'no_trigger', 'apply_segmentation', 'web_search', 'thinking'
         ];
 
@@ -134,7 +134,7 @@ class GhostwriterConfig {
 
         // Boolean fields
         const boolFields = [
-            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress', 'no_select_pen', 'no_color',
+            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress', 'no_select_pen', 'no_color', 'stream',
             'no_loop', 'no_trigger', 'apply_segmentation', 'web_search', 'thinking'
         ];
 
