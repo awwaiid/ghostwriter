@@ -758,6 +758,19 @@ impl Touch {
         Ok(PenRestore { tool, ..PenRestore::NOTHING })
     }
 
+    /// Change the colour of a pen that `select_pen` has selected, to carry on drawing in
+    /// another ink. `restore` is what `select_pen` returned, and is brought up to date
+    /// so that the colour the pen had to begin with is the one that gets put back.
+    /// Only where the palette can be read off the screen.
+    pub async fn change_pen_colour(&mut self, pen: PenSetup, colour: u32, restore: &mut PenRestore) -> Result<()> {
+        let palette = Palette::new()?;
+        self.open_palette(&palette).await?;
+        self.open_pen_settings(&palette, pen.slot).await?;
+        let before = self.choose_colour(&palette, pen.slot, colour).await?;
+        restore.colour = restore.colour.or(before);
+        self.close_palette(&palette).await
+    }
+
     /// Put back the tool, and the pen's settings, that `select_pen` changed.
     pub async fn restore_pen(&mut self, pen: PenSetup, restore: PenRestore) -> Result<()> {
         if let Ok(palette) = Palette::new() {

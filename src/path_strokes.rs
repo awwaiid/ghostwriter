@@ -12,7 +12,7 @@
 
 use resvg::usvg::{self, tiny_skia_path, Group, LineCap, Node, Transform, Tree};
 
-use crate::stroke_plan::{PenModel, Point, Segment};
+use crate::stroke_plan::{Ink, PenModel, Point, Segment};
 
 /// How far a curve may stray from the straight steps that stand in for it, in pixels.
 const FLATNESS: f32 = 0.2;
@@ -41,15 +41,15 @@ struct Polyline {
     closed: bool,
 }
 
-/// The strokes that draw the lines of an SVG with `pen`, in page pixels.
-pub(crate) fn along_paths(tree: &Tree, page_size: (u32, u32), pen: &PenModel) -> Vec<Segment> {
+/// The strokes that draw the lines of an SVG with `pen`, in page pixels, and the ink each is in.
+pub(crate) fn along_paths(tree: &Tree, page_size: (u32, u32), pen: &PenModel) -> Vec<(Ink, Segment)> {
     let to_page = Transform::from_scale(page_size.0 as f32 / tree.size().width(), page_size.1 as f32 / tree.size().height());
     let mut strokes = Vec::new();
     visit_group(tree.root(), to_page, pen, &mut strokes);
     strokes
 }
 
-fn visit_group(group: &Group, to_page: Transform, pen: &PenModel, strokes: &mut Vec<Segment>) {
+fn visit_group(group: &Group, to_page: Transform, pen: &PenModel, strokes: &mut Vec<(Ink, Segment)>) {
     // What is clipped, masked, filtered or faint is not simply where its paths are
     if group.clip_path().is_some() || group.mask().is_some() || !group.filters().is_empty() || group.opacity().get() < 0.5 {
         return;
@@ -64,9 +64,16 @@ fn visit_group(group: &Group, to_page: Transform, pen: &PenModel, strokes: &mut 
     }
 }
 
-/// The strokes that draw the line of one path, if it has one.
-fn path_strokes(path: &usvg::Path, to_page: Transform, pen: &PenModel) -> Vec<Segment> {
+/// The strokes that draw the line of one path, if it has one, and the ink it is in.
+fn path_strokes(path: &usvg::Path, to_page: Transform, pen: &PenModel) -> Vec<(Ink, Segment)> {
     let Some(stroke) = path.stroke().filter(|stroke| path.is_visible() && stroke.opacity().get() >= 0.5) else {
+        return Vec::new();
+    };
+    // A line in one plain colour, and not one too pale to draw
+    let usvg::Paint::Color(colour) = stroke.paint() else {
+        return Vec::new();
+    };
+    let Some(ink) = Ink::nearest(colour.red, colour.green, colour.blue) else {
         return Vec::new();
     };
 
@@ -92,6 +99,7 @@ fn path_strokes(path: &usvg::Path, to_page: Transform, pen: &PenModel) -> Vec<Se
     polylines
         .iter()
         .flat_map(|polyline| line_strokes(polyline, width, stroke.linecap(), pen))
+        .map(|step| (ink, step))
         .collect()
 }
 
@@ -453,6 +461,9 @@ mod tests {
     fn strokes_for(body: &str, pen: &PenModel) -> Vec<Segment> {
         let svg = format!(r#"<svg width="400" height="400" xmlns="http://www.w3.org/2000/svg">{body}</svg>"#);
         along_paths(&parse_svg(&svg).unwrap(), (400, 400), pen)
+            .into_iter()
+            .map(|(_, step)| step)
+            .collect()
     }
 
     fn length((from, to): &Segment) -> f32 {
@@ -561,6 +572,23 @@ mod tests {
 
         // Shifted to the left of travel: up from the first step, right of the second
         assert_eq!(moved, vec![(0.0, -2.0), (12.0, -2.0), (12.0, 10.0)]);
+    }
+
+    #[test]
+    fn a_line_is_in_the_ink_nearest_its_colour() {
+        let svg = r##"<svg width="400" height="400" xmlns="http://www.w3.org/2000/svg">
+            <line x1="50" y1="50" x2="350" y2="250" stroke="#d00" stroke-width="2"/>
+            <line x1="50" y1="100" x2="350" y2="300" stroke="black" stroke-width="2"/>
+            <line x1="50" y1="150" x2="350" y2="350" stroke="#f8f8f8" stroke-width="2"/>
+        </svg>"##;
+
+        let inks: Vec<Ink> = along_paths(&parse_svg(svg).unwrap(), (400, 400), FINELINER)
+            .into_iter()
+            .map(|(ink, _)| ink)
+            .collect();
+
+        // The third is too pale to draw
+        assert_eq!(inks, vec![Ink::Red, Ink::Black]);
     }
 
     #[test]

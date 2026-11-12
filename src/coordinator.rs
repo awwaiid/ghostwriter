@@ -8,7 +8,7 @@ use tokio::time::{sleep, Duration};
 use crate::cancellation::GhostwriterCancellation;
 use crate::config::Config;
 use crate::device::FullSpeed;
-use crate::embedded_assets::load_config;
+use crate::embedded_assets::{for_colour_display, load_config};
 use crate::keyboard::Keyboard;
 use crate::llm_engine::{LLMEngine, ModelExecutionStatus};
 use crate::screenshot::Screenshot;
@@ -345,7 +345,10 @@ pub async fn processing_task(
     };
 
     // Load prompt
-    let prompt_general_raw = load_config(&config.prompt)?;
+    let mut prompt_general_raw = load_config(&config.prompt)?;
+    if config.draws_in_colour() {
+        prompt_general_raw = for_colour_display(&prompt_general_raw);
+    }
     let prompt_general_json = serde_json::from_str::<serde_json::Value>(prompt_general_raw.as_str())?;
     let mut prompt = prompt_general_json["prompt"]
         .as_str()

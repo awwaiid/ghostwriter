@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::screenshot::{ScreenProbe, Screenshot};
-use crate::stroke_plan::{plan_strokes, watch_pixels, PenModel};
+use crate::stroke_plan::{plan_drawing, watch_pixels, Ink, PenModel};
 use crate::touch::PenSetup;
 use crate::util::{parse_svg, svg_to_alpha_bitmap};
 
@@ -105,11 +105,15 @@ impl DrawingPen {
         }
     }
 
-    /// How the pen is set up in the palette, for selecting it.
-    pub fn setup(self) -> PenSetup {
-        match self {
+    /// How the pen is set up in the palette to draw in `ink`, for selecting it.
+    pub fn setup(self, ink: Ink) -> PenSetup {
+        let black = match self {
             Self::Fineliner => PenSetup::FINELINER_THIN,
             Self::Ballpoint => PenSetup::BALLPOINT_MEDIUM,
+        };
+        PenSetup {
+            colour: ink.palette_place(),
+            ..black
         }
     }
 }
@@ -118,8 +122,9 @@ impl DrawingPen {
 /// second, which can be spent while something else is going on.
 pub enum Drawing {
     /// Strokes planned for a pen that has been measured on the Paper Pro: a page that
-    /// took half a minute takes a couple of seconds
-    Strokes { strokes: Vec<Stroke>, pen: PenModel },
+    /// took half a minute takes a couple of seconds. They are grouped by the ink they
+    /// are to be drawn in, black first if there is any.
+    Strokes { layers: Vec<(Ink, Vec<Stroke>)>, pen: PenModel },
     /// Row by row, with pen pressure standing in for anti-aliasing. Each row of the
     /// page is `scale` rows of alpha values.
     Rows { alpha: Vec<Vec<u8>>, scale: u32 },
@@ -131,9 +136,10 @@ impl Drawing {
         match device_model {
             DeviceModel::RemarkablePaperPro => {
                 let started = Instant::now();
-                let strokes = plan_strokes(svg_data, device_model.page_size(), &pen)?;
-                info!("Planned {} strokes in {:?}", strokes.len(), started.elapsed());
-                Ok(Self::Strokes { strokes, pen })
+                let layers = plan_drawing(svg_data, device_model.page_size(), &pen)?;
+                let strokes: usize = layers.iter().map(|layer| layer.1.len()).sum();
+                info!("Planned {} strokes in {} inks in {:?}", strokes, layers.len(), started.elapsed());
+                Ok(Self::Strokes { layers, pen })
             }
             _ => {
                 let scale = 2;
@@ -679,7 +685,8 @@ impl Pen {
         Ok(())
     }
 
-    /// Draw what was planned for an SVG.
+    /// Draw what was planned for an SVG, all of it with the pen as it is: whatever ink
+    /// each part was meant to be in, it comes out in the colour the pen is set to.
     ///
     /// With `check_pen`, the first stroke is drawn on its own and looked at. If it has
     /// not come out the way the pen the drawing was planned for would draw it, nothing
@@ -687,20 +694,27 @@ impl Pen {
     /// screen cannot be watched there is no telling, and the whole drawing is drawn.)
     pub fn draw(&mut self, drawing: &Drawing, check_pen: bool) -> Result<bool> {
         match drawing {
-            Drawing::Strokes { strokes, pen } => {
-                self.tail = pen.tail;
-                let drawn = match Screenshot::new().and_then(|mut screenshot| screenshot.probe()) {
-                    Ok(screen) => self.draw_strokes_watched(strokes, &screen, pen, check_pen),
-                    Err(e) => {
-                        info!("Drawing without watching the screen: {}", e);
-                        self.draw_strokes(strokes, &StrokeTiming::unwatched()).map(|()| true)
-                    }
-                };
-                self.tail = 0.0;
-                drawn
+            Drawing::Strokes { layers, pen } => {
+                let strokes: Vec<Stroke> = layers.iter().flat_map(|(_, strokes)| strokes.iter().cloned()).collect();
+                self.draw_planned_strokes(&strokes, pen, check_pen)
             }
             Drawing::Rows { alpha, scale } => self.draw_bitmap_alpha_pressure(alpha, *scale).map(|()| true),
         }
+    }
+
+    /// Draw strokes planned for `pen`, the pen that is selected on the device, watching
+    /// the screen if it can be watched. `check_pen` is as for `draw`.
+    pub fn draw_planned_strokes(&mut self, strokes: &[Stroke], pen: &PenModel, check_pen: bool) -> Result<bool> {
+        self.tail = pen.tail;
+        let drawn = match Screenshot::new().and_then(|mut screenshot| screenshot.probe()) {
+            Ok(screen) => self.draw_strokes_watched(strokes, &screen, pen, check_pen),
+            Err(e) => {
+                info!("Drawing without watching the screen: {}", e);
+                self.draw_strokes(strokes, &StrokeTiming::unwatched()).map(|()| true)
+            }
+        };
+        self.tail = 0.0;
+        drawn
     }
 
     /// Draw one stroke and see whether it came out the way `pen` draws: there at all, and

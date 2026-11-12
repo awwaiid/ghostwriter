@@ -25,7 +25,7 @@ use crate::device::{VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::path_strokes;
 use crate::pen::{Stroke, FULL_PRESSURE};
 use crate::skeleton;
-use crate::util::{parse_svg, svg_to_alpha_bitmap, tree_to_alpha_bitmap};
+use crate::util::{parse_svg, render_tree, svg_to_alpha_bitmap};
 
 /// What planning needs to know about a pen: how its strokes come out on the device.
 ///
@@ -112,6 +112,59 @@ impl PenModel {
         } else {
             1.0
         }
+    }
+}
+
+/// The inks a drawing can be made in: the colours the Paper Pro's pens come in, but for white.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ink {
+    Black,
+    Gray,
+    Blue,
+    Red,
+    Green,
+    Yellow,
+    Cyan,
+    Magenta,
+}
+
+impl Ink {
+    /// Every ink, black first: it is the one most of any drawing is in.
+    pub const ALL: [Ink; 8] = [Ink::Black, Ink::Gray, Ink::Blue, Ink::Red, Ink::Green, Ink::Yellow, Ink::Cyan, Ink::Magenta];
+
+    /// The ink's place among the nine colours in a pen's settings (white is the third).
+    pub fn palette_place(self) -> u32 {
+        match self {
+            Ink::Black => 0,
+            Ink::Gray => 1,
+            Ink::Blue => 3,
+            Ink::Red => 4,
+            Ink::Green => 5,
+            Ink::Yellow => 6,
+            Ink::Cyan => 7,
+            Ink::Magenta => 8,
+        }
+    }
+
+    fn rgb(self) -> (i32, i32, i32) {
+        match self {
+            Ink::Black => (0, 0, 0),
+            Ink::Gray => (128, 128, 128),
+            Ink::Blue => (0, 0, 255),
+            Ink::Red => (255, 0, 0),
+            Ink::Green => (0, 255, 0),
+            Ink::Yellow => (255, 255, 0),
+            Ink::Cyan => (0, 255, 255),
+            Ink::Magenta => (255, 0, 255),
+        }
+    }
+
+    /// The ink nearest to a colour, or None if the white of the paper is nearer still:
+    /// a white or pale shape is not drawn at all.
+    pub fn nearest(red: u8, green: u8, blue: u8) -> Option<Ink> {
+        let far_from = |(r, g, b): (i32, i32, i32)| (red as i32 - r).pow(2) + (green as i32 - g).pow(2) + (blue as i32 - b).pow(2);
+        let nearest = Ink::ALL.into_iter().min_by_key(|ink| far_from(ink.rgb()))?;
+        (far_from(nearest.rgb()) < far_from((255, 255, 255))).then_some(nearest)
     }
 }
 
@@ -270,51 +323,98 @@ impl Grid {
     }
 }
 
-/// Plan the strokes that draw an SVG with `pen` on a page of `page_size` device pixels.
-/// The strokes are in virtual page coordinates, ready for `Pen::draw_strokes`.
+/// Plan the strokes that draw an SVG with `pen` on a page of `page_size` device pixels,
+/// whatever ink each is in. The strokes are in virtual page coordinates, ready for
+/// `Pen::draw_strokes`.
 pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Result<Vec<Stroke>> {
+    Ok(plan_drawing(svg_data, page_size, pen)?.into_iter().flat_map(|(_, strokes)| strokes).collect())
+}
+
+/// Plan the strokes that draw an SVG with `pen` on a page of `page_size` device pixels:
+/// those for each ink the drawing calls for, black first. Each colour in the SVG is
+/// drawn in the ink nearest to it, and what is white or pale is left as bare paper.
+pub fn plan_drawing(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Result<Vec<(Ink, Vec<Stroke>)>> {
     let (width, height) = (page_size.0 as usize, page_size.1 as usize);
     let started = std::time::Instant::now();
-    // An SVG that cannot be read is drawn as a marker saying so, which has no lines to follow
+    // An SVG that cannot be read is drawn as a marker saying so, in black, which has no lines to follow
     let parsed = parse_svg(svg_data);
     debug!("Parsed the SVG after {:?}", started.elapsed());
-    let (coverage, lines) = match parsed {
+    let (inks, mut lines): (Vec<Option<Ink>>, Vec<(Ink, Segment)>) = match parsed {
         Ok(tree) => {
-            let coverage = tree_to_alpha_bitmap(&tree, page_size.0, page_size.1)?;
+            let rendered = render_tree(&tree, page_size.0, page_size.1)?;
             debug!("Rendered it after {:?}", started.elapsed());
-            (coverage, path_strokes::along_paths(&tree, page_size, pen))
+            let inks = rendered
+                .pixels()
+                .iter()
+                .map(|pixel| {
+                    let colour = pixel.demultiply();
+                    (colour.alpha() >= 128)
+                        .then(|| Ink::nearest(colour.red(), colour.green(), colour.blue()))
+                        .flatten()
+                })
+                .collect();
+            (inks, path_strokes::along_paths(&tree, page_size, pen))
         }
-        Err(_) => (svg_to_alpha_bitmap(svg_data, page_size.0, page_size.1)?, Vec::new()),
-    };
-    let ink = Grid {
-        width,
-        height,
-        cells: coverage.iter().flat_map(|row| row.iter().map(|&alpha| alpha >= 128)).collect(),
+        Err(_) => {
+            let coverage = svg_to_alpha_bitmap(svg_data, page_size.0, page_size.1)?;
+            let inks = coverage.iter().flatten().map(|&alpha| (alpha >= 128).then_some(Ink::Black)).collect();
+            (inks, Vec::new())
+        }
     };
     debug!("Followed its lines after {:?}", started.elapsed());
 
+    // A line is only followed where it shows: not where something else is drawn over it
+    let ink_at = |(x, y): Point| {
+        let (x, y) = (x.floor(), y.floor());
+        (x >= 0.0 && y >= 0.0 && (x as usize) < width && (y as usize) < height)
+            .then(|| inks[y as usize * width + x as usize])
+            .flatten()
+    };
+    lines.retain(|&(ink, (from, to))| ink_at(((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0)) == Some(ink));
+
+    let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
+    let mut layers = Vec::new();
+    let called_for: std::collections::HashSet<Ink> = inks.iter().flatten().copied().collect();
+    for ink in Ink::ALL.into_iter().filter(|ink| called_for.contains(ink)) {
+        let of_this_ink = Grid {
+            width,
+            height,
+            cells: inks.iter().map(|&at| at == Some(ink)).collect(),
+        };
+        let lines: Vec<Segment> = lines.iter().filter(|line| line.0 == ink).map(|line| line.1).collect();
+        let strokes = plan_one_ink(&of_this_ink, lines, page_size, pen);
+        if !strokes.is_empty() {
+            debug!("{} strokes in {:?}, after {:?}", strokes.len(), ink, started.elapsed());
+            let strokes = strokes
+                .into_iter()
+                .map(|(from, to)| Stroke {
+                    points: vec![to_virtual(from), to_virtual(to)],
+                    pressure: FULL_PRESSURE,
+                })
+                .collect();
+            layers.push((ink, strokes));
+        }
+    }
+    Ok(layers)
+}
+
+/// Plan the strokes for the part of a drawing that is in one ink: `ink` is where that
+/// is on the page, and `lines` are strokes already planned along the lines in it.
+fn plan_one_ink(ink: &Grid, lines: Vec<Segment>, page_size: (u32, u32), pen: &PenModel) -> Vec<Segment> {
     // The lines first, and then whatever they leave bare
-    let mut covered = Grid::new(width, height);
+    let mut covered = Grid::new(ink.width, ink.height);
     for &(from, to) in &lines {
         for_each_pixel_near(from, to, page_size, pen, 0.0, |x, y, _, _| covered.set(x, y, true));
     }
     let mut strokes = lines;
-    let along_lines = strokes.len();
     // The rest is planned within the part of the page that has ink on it, which is
     // usually a small part
     if let Some((left, top, width, height)) = ink.bounds() {
         let ink = ink.cropped(left, top, width, height);
         let mut covered = covered.cropped(left, top, width, height);
         drop_slivers(&ink, &mut covered);
-        debug!("Marked what they ink after {:?}", started.elapsed());
         let on_page = |(x, y): Point| (x + left as f32, y + top as f32);
         strokes.extend(plan_ink(&ink, covered, pen).into_iter().map(|(from, to)| (on_page(from), on_page(to))));
-        debug!(
-            "{} strokes along lines and {} for the rest, after {:?}",
-            along_lines,
-            strokes.len() - along_lines,
-            started.elapsed()
-        );
 
         let in_the_crop = |(x, y): Point| (x - left as f32, y - top as f32);
         let order = drawing_order(
@@ -322,17 +422,8 @@ pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
             &ink,
         );
         strokes = order.into_iter().map(|index| strokes[index]).collect();
-        debug!("Put them in order after {:?}", started.elapsed());
     }
-
-    let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
-    Ok(strokes
-        .into_iter()
-        .map(|(from, to)| Stroke {
-            points: vec![to_virtual(from), to_virtual(to)],
-            pressure: FULL_PRESSURE,
-        })
-        .collect())
+    strokes
 }
 
 /// The order to draw strokes in, as indexes into `strokes`: one shape at a time, the
@@ -958,6 +1049,49 @@ mod tests {
     }
 
     #[test]
+    fn each_colour_is_drawn_in_the_nearest_ink_and_white_not_at_all() {
+        let svg = r##"<svg width="768" height="1024" xmlns="http://www.w3.org/2000/svg">
+            <rect width="768" height="1024" fill="white"/>
+            <rect x="100" y="100" width="60" height="40" fill="#222"/>
+            <rect x="300" y="100" width="60" height="40" fill="crimson"/>
+            <rect x="500" y="100" width="60" height="40" fill="#eee"/>
+            <line x1="100" y1="300" x2="400" y2="500" stroke="navy" stroke-width="4"/>
+            <line x1="100" y1="600" x2="400" y2="800" stroke="white" stroke-width="4"/>
+        </svg>"##;
+        let page_size = (768, 1024);
+
+        let layers = plan_drawing(svg, page_size, FINELINER).unwrap();
+
+        let inks: Vec<Ink> = layers.iter().map(|layer| layer.0).collect();
+        assert_eq!(inks, vec![Ink::Black, Ink::Blue, Ink::Red]);
+        // Each layer inks its own shape and nothing else: the white background and line, and the pale block, are bare
+        let inked = |ink: Ink, x: usize, y: usize| {
+            let strokes = &layers.iter().find(|layer| layer.0 == ink).unwrap().1;
+            simulate(strokes, page_size, FINELINER)[y][x]
+        };
+        assert!(inked(Ink::Black, 130, 120) && !inked(Ink::Black, 330, 120) && !inked(Ink::Black, 530, 120));
+        assert!(inked(Ink::Red, 330, 120) && !inked(Ink::Red, 130, 120));
+        assert!(inked(Ink::Blue, 250, 400) && !inked(Ink::Blue, 250, 700));
+        assert!(Ink::ALL.iter().all(|&ink| !layers.iter().any(|layer| layer.0 == ink) || !inked(ink, 20, 20)));
+    }
+
+    #[test]
+    fn a_line_is_not_followed_where_something_is_drawn_over_it() {
+        // A slanting line with a white block over its middle
+        let svg = r#"<svg width="768" height="1024" xmlns="http://www.w3.org/2000/svg">
+            <line x1="100" y1="100" x2="500" y2="400" stroke="black" stroke-width="2"/>
+            <rect x="250" y="150" width="100" height="200" fill="white"/>
+        </svg>"#;
+        let page_size = (768, 1024);
+
+        let strokes = plan_strokes(svg, page_size, FINELINER).unwrap();
+        let drawn = simulate(&strokes, page_size, FINELINER);
+
+        assert!(drawn[175][200] && drawn[325][400], "the line is drawn either side of the block");
+        assert!(!drawn[250][300], "and not under it");
+    }
+
+    #[test]
     fn shapes_are_drawn_one_at_a_time_in_reading_order() {
         // Three blocks on one line and one on the next, the second line starting further left
         let mut ink = Grid::new(60, 40);
@@ -1085,7 +1219,7 @@ mod tests {
 
         let strokes = plan_strokes(svg, page_size, FINELINER).unwrap();
         let drawn = simulate(&strokes, page_size, FINELINER);
-        let wanted = svg_to_alpha_bitmap(svg, page_size.0, page_size.1).unwrap();
+        let wanted = crate::util::svg_to_alpha_bitmap(svg, page_size.0, page_size.1).unwrap();
 
         let mut wrong = 0;
         let mut total = 0;

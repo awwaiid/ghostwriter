@@ -5,7 +5,7 @@ use ghostwriter::device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH}
 use ghostwriter::drawing_lab;
 use ghostwriter::pen::{Drawing, DrawingPen, Pen, StrokeTiming};
 use ghostwriter::screenshot::Screenshot;
-use ghostwriter::stroke_plan::{plan_strokes, simulate, PenModel};
+use ghostwriter::stroke_plan::{plan_strokes, simulate, Ink, PenModel};
 use ghostwriter::touch::{PenTool, Touch, TriggerCorner};
 use ghostwriter::util::{svg_to_alpha_bitmap, svg_to_bitmap, svg_to_bitmap_threshold};
 use std::thread::sleep as std_sleep;
@@ -706,11 +706,29 @@ async fn main() -> Result<()> {
                 println!("elapsed_ms={} pen_as_planned={}", started.elapsed().as_millis(), as_planned);
             } else {
                 let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
-                let restore = touch.select_pen(pen.setup()).await?;
+                let mut restore = touch.select_pen(pen.setup(Ink::Black)).await?;
                 let selected = started.elapsed();
-                Pen::new(false)?.draw_svg(&svg, pen.model())?;
+                let drawing = Drawing::plan(&svg, DeviceModel::detect(), pen.model())?;
+                let mut drawer = Pen::new(false)?;
+                match &drawing {
+                    // One ink at a time, changing the pen's colour in between
+                    Drawing::Strokes { layers, pen: model } => {
+                        let mut colour = Ink::Black;
+                        for (ink, strokes) in layers {
+                            if *ink != colour {
+                                let setup = pen.setup(*ink);
+                                touch.change_pen_colour(setup, setup.colour, &mut restore).await?;
+                                colour = *ink;
+                            }
+                            drawer.draw_planned_strokes(strokes, model, false)?;
+                        }
+                    }
+                    Drawing::Rows { .. } => {
+                        drawer.draw(&drawing, false)?;
+                    }
+                }
                 let drawn = started.elapsed();
-                touch.restore_pen(pen.setup(), restore).await?;
+                touch.restore_pen(pen.setup(Ink::Black), restore).await?;
                 println!(
                     "elapsed_ms={} select_ms={} restore_ms={}",
                     (drawn - selected).as_millis(),

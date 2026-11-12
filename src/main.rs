@@ -14,12 +14,13 @@ use ghostwriter::{
     config::Config,
     coordinator::{self, CoordinatorChannels, ProgressState},
     device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
-    embedded_assets::load_config,
+    embedded_assets::{for_colour_display, load_config},
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
     pen::{Drawing, DrawingPen, Pen},
     simulation::SimulationConfig,
     status::GhostwriterStatus,
+    stroke_plan::Ink,
     touch::{PenRestore, PenSetup, Touch, TriggerCorner},
     util::{setup_uinput, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
@@ -104,6 +105,11 @@ pub struct Args {
     #[arg(long)]
     #[serde(skip_serializing_if = "is_false")]
     no_select_pen: bool,
+
+    /// Do not tell the model that it can draw in colour (reMarkable Paper Pro)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "is_false")]
+    no_color: bool,
 
     /// Input PNG file for testing
     #[arg(long)]
@@ -285,6 +291,17 @@ fn select_pen(setup: PenSetup) -> Result<PenRestore> {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_pen(setup).await }))
 }
 
+/// Change the colour of the pen that `select_pen` selected to the colour in `setup`.
+fn change_pen_colour(setup: PenSetup, restore: &mut PenRestore) -> Result<()> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            Touch::new(false, TriggerCorner::UpperRight)?
+                .change_pen_colour(setup, setup.colour, restore)
+                .await
+        })
+    })
+}
+
 fn restore_pen(setup: PenSetup, restore: PenRestore) -> Result<()> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.restore_pen(setup, restore).await })
@@ -320,23 +337,43 @@ fn draw_svg(svg_data: &str, keyboard: &Mutex<Keyboard>, pen: &Mutex<Pen>, how: &
     }
 
     // Select the pen, remembering what to put back. Meanwhile, work out how to draw the SVG.
-    let (restore, drawing) = std::thread::scope(|scope| {
+    let (selected, drawing) = std::thread::scope(|scope| {
         let planning = scope.spawn(|| match drawing {
             Some(planned) => Ok(planned),
             None => Drawing::plan(svg_data, device_model, how.pen.model()),
         });
-        let restore = select_pen(how.pen.setup()).unwrap_or_else(|e| {
-            log::error!("Failed to select the pen: {}", e);
-            PenRestore::NOTHING
-        });
-        (restore, planning.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Planning the drawing failed"))))
+        // The pen starts out black; if the drawing turns out to start in another ink, that is changed below
+        let selected = select_pen(how.pen.setup(Ink::Black));
+        (
+            selected,
+            planning.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Planning the drawing failed"))),
+        )
     });
-    let drawn = drawing.and_then(|drawing| lock!(pen).draw(&drawing, false));
+    let mut restore = selected.unwrap_or_else(|e| {
+        log::error!("Failed to select the pen: {}", e);
+        PenRestore::NOTHING
+    });
 
-    if let Err(e) = restore_pen(how.pen.setup(), restore) {
+    let drawn = drawing.and_then(|drawing| match &drawing {
+        // One ink at a time, changing the pen's colour in between
+        Drawing::Strokes { layers, pen: model } => {
+            let mut colour = Ink::Black;
+            for (ink, strokes) in layers {
+                if *ink != colour {
+                    change_pen_colour(how.pen.setup(*ink), &mut restore)?;
+                    colour = *ink;
+                }
+                lock!(pen).draw_planned_strokes(strokes, model, false)?;
+            }
+            Ok(())
+        }
+        Drawing::Rows { .. } => lock!(pen).draw(&drawing, false).map(|_| ()),
+    });
+
+    if let Err(e) = restore_pen(how.pen.setup(Ink::Black), restore) {
         log::error!("Failed to put the pen back: {}", e);
     }
-    drawn.map(|_| ())
+    drawn
 }
 
 fn determine_engine_name(engine_arg: &Option<String>, model: &str) -> Result<String> {
@@ -710,7 +747,11 @@ fn register_tools(
         let keyboard_clone = Arc::clone(&keyboard);
         let pen_clone = Arc::clone(&pen);
 
-        let tool_config_draw_svg = load_config("tool_draw_svg.json")?;
+        let mut tool_config_draw_svg = load_config("tool_draw_svg.json")?;
+        if config.draws_in_colour() {
+            info!("Telling the model it can draw in colour");
+            tool_config_draw_svg = for_colour_display(&tool_config_draw_svg);
+        }
         engine.register_tool(
             "draw_svg",
             serde_json::from_str::<serde_json::Value>(tool_config_draw_svg.as_str())?,
