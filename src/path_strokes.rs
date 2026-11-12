@@ -258,6 +258,7 @@ fn line_strokes(polyline: &Polyline, width: f32, cap: LineCap, pen: &PenModel) -
 
     let mut strokes = Vec::new();
     for stretch in stretches_for_the_pen(polyline) {
+        let mut passes: Vec<Vec<Segment>> = Vec::new();
         for &offset in &offsets {
             let mut points = offset_path(&stretch.points, stretch.closed, offset);
             if stretch.closed {
@@ -280,7 +281,16 @@ fn line_strokes(polyline: &Polyline, width: f32, cap: LineCap, pen: &PenModel) -
                 move_end(&mut points, past_end);
             }
 
-            strokes.extend(steps(&points));
+            passes.push(steps(&points));
+        }
+
+        // The passes go forward together, a step of each in turn, so that the line
+        // grows at its full width. (It also keeps a stroke with clean paper around it
+        // coming up every few strokes, which is how drawing is paced: see
+        // `stroke_plan::watch_pixels`.)
+        let longest = passes.iter().map(Vec::len).max().unwrap_or(0);
+        for step in 0..longest {
+            strokes.extend(passes.iter().filter_map(|pass| pass.get(step)));
         }
     }
     strokes

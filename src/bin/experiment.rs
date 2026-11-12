@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use evdev::{Device, EventType as EvdevEventType, InputEvent};
 use ghostwriter::device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use ghostwriter::drawing_lab;
-use ghostwriter::pen::{Pen, StrokeTiming};
+use ghostwriter::pen::{Drawing, DrawingPen, Pen, StrokeTiming};
 use ghostwriter::screenshot::Screenshot;
 use ghostwriter::stroke_plan::{plan_strokes, simulate, PenModel};
 use ghostwriter::touch::{PenTool, Touch, TriggerCorner};
@@ -209,6 +209,15 @@ enum Commands {
         /// Extra points along the bar, as distances from its start in device pixels, separated by commas
         #[arg(long, default_value = "")]
         via: String,
+    },
+    /// Draw a short stroke, wait, tap the palette's button once, and report whether and
+    /// when the palette opened: how soon after the pen the tablet takes a touch
+    TapAfterPen {
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
+        /// How many strokes to draw first
+        #[arg(long, default_value_t = 1)]
+        strokes: usize,
     },
     /// Render where an SVG file puts ink, at the device's page size, to compare a capture with.
     /// Run on the device this uses the device's own fonts
@@ -631,7 +640,7 @@ async fn main() -> Result<()> {
             pause_ms,
             spin,
         } => {
-            let pen = pen_model(&pen)?;
+            let pen = DrawingPen::from_name(&pen)?.model();
             let (width, height) = page.split_once('x').ok_or_else(|| anyhow::anyhow!("--page looks like 1632x2154"))?;
             let page_size = (width.parse()?, height.parse()?);
             let svg = std::fs::read_to_string(&svg_path)?;
@@ -689,13 +698,25 @@ async fn main() -> Result<()> {
         Commands::DrawPlanned { svg_path, pen, no_select } => {
             let _full_speed = FullSpeed::hold();
             let svg = std::fs::read_to_string(&svg_path)?;
-            let pen = pen_model(&pen)?;
+            let pen = DrawingPen::from_name(&pen)?;
+            let started = std::time::Instant::now();
             if no_select {
-                let started = std::time::Instant::now();
-                Pen::new(false)?.draw_svg(&svg, pen)?;
-                println!("elapsed_ms={}", started.elapsed().as_millis());
+                let drawing = Drawing::plan(&svg, DeviceModel::detect(), pen.model())?;
+                let as_planned = Pen::new(false)?.draw(&drawing, true)?;
+                println!("elapsed_ms={} pen_as_planned={}", started.elapsed().as_millis(), as_planned);
             } else {
-                with_fineliner(|| Pen::new(false)?.draw_svg(&svg, pen)).await?;
+                let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
+                let restore = touch.select_pen(pen.setup()).await?;
+                let selected = started.elapsed();
+                Pen::new(false)?.draw_svg(&svg, pen.model())?;
+                let drawn = started.elapsed();
+                touch.restore_pen(pen.setup(), restore).await?;
+                println!(
+                    "elapsed_ms={} select_ms={} restore_ms={}",
+                    (drawn - selected).as_millis(),
+                    selected.as_millis(),
+                    (started.elapsed() - drawn).as_millis()
+                );
             }
         }
 
@@ -890,6 +911,45 @@ async fn main() -> Result<()> {
                         .collect();
                     println!("  along {name}: start-5..+3: {}   end-4..+4: {}", before.join(" "), after.join(" "));
                 }
+            }
+        }
+
+        Commands::TapAfterPen { delay_ms, strokes } => {
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight)?;
+            anyhow::ensure!(!Touch::palette_is_open()?, "Close the palette first");
+            let short_strokes: Vec<ghostwriter::pen::Stroke> = (0..strokes)
+                .map(|index| ghostwriter::pen::Stroke {
+                    points: vec![(300.0 + (index % 40) as f32 * 4.0, 900.0), (302.0 + (index % 40) as f32 * 4.0, 900.0)],
+                    pressure: ghostwriter::pen::FULL_PRESSURE,
+                })
+                .collect();
+            Pen::new(false)?.draw_strokes(&short_strokes, &StrokeTiming::default())?;
+            sleep(Duration::from_millis(delay_ms)).await;
+
+            touch.tap_palette_button().await?;
+            let tapped_at = std::time::Instant::now();
+            let mut opened = None;
+            while tapped_at.elapsed() < Duration::from_millis(700) && opened.is_none() {
+                if Touch::palette_is_open()? {
+                    opened = Some(tapped_at.elapsed());
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+            println!(
+                "tap {} ms after {} strokes: opened={:?}",
+                delay_ms,
+                strokes,
+                opened.map(|after| after.as_millis())
+            );
+
+            // Leave the palette closed
+            sleep(Duration::from_millis(600)).await;
+            for _ in 0..3 {
+                if !Touch::palette_is_open()? {
+                    break;
+                }
+                touch.tap_palette_button().await?;
+                sleep(Duration::from_millis(700)).await;
             }
         }
 
@@ -1142,15 +1202,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// The measured pen that goes by a name on the command line.
-fn pen_model(name: &str) -> Result<PenModel> {
-    match name {
-        "fineliner" => Ok(PenModel::FINELINER_THIN),
-        "ballpoint" => Ok(PenModel::BALLPOINT_MEDIUM),
-        other => anyhow::bail!("Unknown pen {other}: use fineliner or ballpoint"),
-    }
 }
 
 fn gcd(a: usize, b: usize) -> usize {

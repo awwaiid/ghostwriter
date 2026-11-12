@@ -1,4 +1,5 @@
 use crate::device::DeviceModel;
+use crate::pen::DrawingPen;
 use crate::touch::TriggerCorner;
 use anyhow::Result;
 use figment::{
@@ -20,6 +21,8 @@ pub struct Config {
     pub no_svg: bool,
     pub no_keyboard: bool,
     pub no_draw_progress: bool,
+    pub pen: String,
+    pub no_select_pen: bool,
     pub input_png: Option<String>,
     pub output_file: Option<String>,
     pub model_output_file: Option<String>,
@@ -55,6 +58,8 @@ impl Default for Config {
             no_svg: false,
             no_keyboard: false,
             no_draw_progress: false,
+            pen: "fineliner".to_string(),
+            no_select_pen: false,
             input_png: None,
             output_file: None,
             model_output_file: None,
@@ -126,6 +131,9 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         // Validate trigger corner
         TriggerCorner::from_string(&self.trigger_corner)?;
+
+        // Validate the pen to draw with
+        DrawingPen::from_name(&self.pen)?;
 
         // Validate thinking tokens
         if self.thinking_tokens == 0 {

@@ -71,7 +71,13 @@ impl PenModel {
     /// Whether a stroke from `from` to `to` inks the pixel centred on `centre`. If it
     /// does: how far the centre is from the stroke's line, and how far along the stroke
     /// it is, from 0 at the start to 1 at the end (beyond those, past the ends).
+    #[cfg(test)]
     fn inks(&self, from: Point, to: Point, centre: Point) -> Option<(f32, f32)> {
+        self.reaches(from, to, centre, 0.0)
+    }
+
+    /// The same, for a pixel within `margin` pixels of the ones the stroke inks.
+    fn reaches(&self, from: Point, to: Point, centre: Point, margin: f32) -> Option<(f32, f32)> {
         let (dx, dy) = (to.0 - from.0, to.1 - from.1);
         let length = dx.hypot(dy);
         if length == 0.0 {
@@ -81,8 +87,19 @@ impl PenModel {
         let along = (px * dx + py * dy) / length;
         let across = ((px * dy - py * dx) / length).abs();
         // A hair's breadth of leeway, for centres that sit exactly on the edge
-        let inked = across <= self.half_width() + 0.01 && along >= -Self::PAST_END - 0.01 && along <= length + Self::PAST_END + 0.01;
-        inked.then_some((across, along / length))
+        let (side, end) = (self.half_width() + margin + 0.01, Self::PAST_END + margin + 0.01);
+        let reached = across <= side && along >= -end && along <= length + end;
+        reached.then_some((across, along / length))
+    }
+
+    /// How far beyond the pixels it inks a stroke leaves a faint edge, in pixels. A
+    /// stroke straight across or down the page, lined up with the pixels, has none.
+    fn soft_edge(from: Point, to: Point) -> f32 {
+        if (from.0 - to.0).abs() < 0.01 || (from.1 - to.1).abs() < 0.01 {
+            0.0
+        } else {
+            1.0
+        }
     }
 }
 
@@ -267,7 +284,7 @@ pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
     // The lines first, and then whatever they leave bare
     let mut covered = Grid::new(width, height);
     for &(from, to) in &lines {
-        for_each_inked_pixel_of(from, to, page_size, pen, |x, y, _, _| covered.set(x, y, true));
+        for_each_pixel_near(from, to, page_size, pen, 0.0, |x, y, _, _| covered.set(x, y, true));
     }
     let mut strokes = lines;
     let along_lines = strokes.len();
@@ -552,42 +569,57 @@ fn simplify(path: &[Point], tolerance: f32) -> Vec<Point> {
 
 /// For each stroke, a page pixel to watch for its ink arriving, in device pixels.
 ///
-/// Where it can be, it is a pixel that no other stroke inks, so that it turning dark
-/// means this very stroke was drawn. Failing that it is one that no earlier stroke
-/// inks, which still shows the device has got this far. A stroke that only goes over
-/// earlier ink has none.
+/// It is a pixel on the middle of the stroke's line, between its two ends, that no
+/// earlier stroke touches: not with its ink, and not with the faint edge that a
+/// slanting stroke has. So ink of any strength there means that the device has drawn
+/// this stroke or a later one, and so has read every stroke up to this one. Where it
+/// can be, it is a pixel that no later stroke touches either, and then ink there means
+/// this very stroke was drawn. A stroke with no such pixel has nothing to watch.
 ///
-/// Only pixels beside the stroke's line, between its two ends, are used. The pixels
-/// around the ends are not inked evenly: the device draws the two sides of a stroke a
-/// pixel out of step with each other.
+/// The pixels around a stroke's ends are not used. They are not inked evenly: the
+/// device draws the two sides of a stroke a pixel out of step with each other.
 pub fn watch_pixels(strokes: &[Stroke], page_size: (u32, u32), pen: &PenModel) -> Vec<Option<(u32, u32)>> {
     let width = page_size.0 as usize;
-    let mut times_inked = vec![0u8; width * page_size.1 as usize];
-    for stroke in strokes {
-        for_each_inked_pixel(stroke, page_size, pen, |x, y, _, _| {
-            let count = &mut times_inked[y * width + x];
+    let ends = |stroke: &Stroke| match (stroke.points.first(), stroke.points.last()) {
+        (Some(&first), Some(&last)) => Some((to_pixels(first, page_size), to_pixels(last, page_size))),
+        _ => None,
+    };
+
+    // How many strokes touch each pixel
+    let mut times_touched = vec![0u8; width * page_size.1 as usize];
+    for (from, to) in strokes.iter().filter_map(ends) {
+        for_each_pixel_near(from, to, page_size, pen, PenModel::soft_edge(from, to), |x, y, _, _| {
+            let count = &mut times_touched[y * width + x];
             *count = count.saturating_add(1);
         });
     }
 
-    let mut inked_before = vec![false; times_inked.len()];
+    let mut touched_before = vec![false; times_touched.len()];
     strokes
         .iter()
         .map(|stroke| {
-            // The best pixel is this stroke's alone, and near its middle
+            let (from, to) = ends(stroke)?;
+            // The best pixel is this stroke's alone, and halfway along
             let mut best = None;
             let mut best_rank = (true, f32::INFINITY);
-            for_each_inked_pixel(stroke, page_size, pen, |x, y, from_line, along| {
-                if inked_before[y * width + x] || from_line > pen.half_width() - 0.4 || along <= 0.0 || along >= 1.0 {
+            for_each_pixel_near(from, to, page_size, pen, 0.0, |x, y, from_line, along| {
+                // Pixels the pen is sure to ink black: those along the middle of its line.
+                // A pen that starts its strokes thin (the kind that needs a tail) is only
+                // sure of them past the first third.
+                let on_the_middle = from_line <= 0.6;
+                let past_thin_start = pen.tail == 0.0 || along >= 0.35;
+                if touched_before[y * width + x] || !on_the_middle || !past_thin_start || along <= 0.0 || along >= 1.0 {
                     return;
                 }
-                let rank = (times_inked[y * width + x] > 1, (along - 0.5).abs());
+                let rank = (times_touched[y * width + x] > 1, (along - 0.5).abs());
                 if rank < best_rank {
                     best_rank = rank;
                     best = Some((x as u32, y as u32));
                 }
             });
-            for_each_inked_pixel(stroke, page_size, pen, |x, y, _, _| inked_before[y * width + x] = true);
+            for_each_pixel_near(from, to, page_size, pen, PenModel::soft_edge(from, to), |x, y, _, _| {
+                touched_before[y * width + x] = true;
+            });
 
             best
         })
@@ -614,12 +646,13 @@ fn to_pixels((x, y): Point, page_size: (u32, u32)) -> Point {
 /// end, beyond those past the ends). A pixel on two parts of a stroke is visited twice.
 fn for_each_inked_pixel(stroke: &Stroke, page_size: (u32, u32), pen: &PenModel, mut visit: impl FnMut(usize, usize, f32, f32)) {
     for pair in stroke.points.windows(2) {
-        for_each_inked_pixel_of(to_pixels(pair[0], page_size), to_pixels(pair[1], page_size), page_size, pen, &mut visit);
+        for_each_pixel_near(to_pixels(pair[0], page_size), to_pixels(pair[1], page_size), page_size, pen, 0.0, &mut visit);
     }
 }
 
-/// The same, for one straight stroke between two points in device pixels.
-fn for_each_inked_pixel_of(from: Point, to: Point, page_size: (u32, u32), pen: &PenModel, mut visit: impl FnMut(usize, usize, f32, f32)) {
+/// The same, for one straight stroke between two points in device pixels, and
+/// reaching `margin` pixels further than its ink does.
+fn for_each_pixel_near(from: Point, to: Point, page_size: (u32, u32), pen: &PenModel, margin: f32, mut visit: impl FnMut(usize, usize, f32, f32)) {
     let (dx, dy) = (to.0 - from.0, to.1 - from.1);
     if dx == 0.0 && dy == 0.0 {
         return;
@@ -630,10 +663,11 @@ fn for_each_inked_pixel_of(from: Point, to: Point, page_size: (u32, u32), pen: &
     let (from_a, from_b, to_a, to_b) = if steep { (from.1, from.0, to.1, to.0) } else { (from.0, from.1, to.0, to.1) };
     let (size_a, size_b) = if steep { (page_size.1, page_size.0) } else { (page_size.0, page_size.1) };
     let slope = (to_b - from_b) / (to_a - from_a);
-    let reach = (pen.half_width() + PenModel::PAST_END) * (1.0 + slope * slope).sqrt() + 1.0;
+    let beyond = PenModel::PAST_END + pen.half_width() + 2.0 * margin;
+    let reach = beyond * (1.0 + slope * slope).sqrt() + 1.0;
 
-    let first_a = (from_a.min(to_a) - PenModel::PAST_END - pen.half_width()).floor().max(0.0) as usize;
-    let last_a = ((from_a.max(to_a) + PenModel::PAST_END + pen.half_width()).ceil().max(0.0) as usize).min(size_a.saturating_sub(1) as usize);
+    let first_a = (from_a.min(to_a) - beyond).floor().max(0.0) as usize;
+    let last_a = ((from_a.max(to_a) + beyond).ceil().max(0.0) as usize).min(size_a.saturating_sub(1) as usize);
     for a in first_a..=last_a {
         // Where the stroke's line is at this column, kept within the stroke's own span
         let along = (a as f32 + 0.5).clamp(from_a.min(to_a), from_a.max(to_a));
@@ -642,7 +676,7 @@ fn for_each_inked_pixel_of(from: Point, to: Point, page_size: (u32, u32), pen: &
         let last_b = ((line_b + reach).ceil().max(0.0) as usize).min(size_b.saturating_sub(1) as usize);
         for b in first_b..=last_b {
             let (x, y) = if steep { (b, a) } else { (a, b) };
-            if let Some((from_line, along)) = pen.inks(from, to, (x as f32 + 0.5, y as f32 + 0.5)) {
+            if let Some((from_line, along)) = pen.reaches(from, to, (x as f32 + 0.5, y as f32 + 0.5), margin) {
                 visit(x, y, from_line, along);
             }
         }
@@ -794,6 +828,27 @@ mod tests {
         let watchable = watched.iter().flatten().count();
         assert!(watchable * 10 >= strokes.len() * 8, "{watchable} of {}", strokes.len());
         assert!(its_own * 10 >= strokes.len() * 7, "{its_own} of {}", strokes.len());
+    }
+
+    #[test]
+    fn a_slanting_stroke_beside_an_earlier_one_has_nothing_to_watch() {
+        let stroke = |points: [Point; 2]| Stroke {
+            points: points.to_vec(),
+            pressure: FULL_PRESSURE,
+        };
+        // Two passes along a slanting line, a little over a pixel apart, and a third well clear
+        let strokes = [
+            stroke([(10.0, 10.0), (50.0, 40.0)]),
+            stroke([(10.7, 9.1), (50.7, 39.1)]),
+            stroke([(14.0, 4.7), (54.0, 34.7)]),
+        ];
+
+        let watched = watch_pixels(&strokes, (768, 1024), FINELINER);
+
+        // The second runs through the faint edge of the first, which would pass for its ink
+        assert!(watched[0].is_some());
+        assert_eq!(watched[1], None);
+        assert!(watched[2].is_some());
     }
 
     #[test]

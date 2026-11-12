@@ -43,13 +43,26 @@ pub struct ScreenProbe {
 impl ScreenProbe {
     /// Whether the pixel at (x, y), in page pixels, is dark. Off the page, or unreadable, is not dark.
     pub fn is_dark(&self, x: u32, y: u32) -> bool {
+        self.brightness(x, y).is_some_and(|brightness| brightness < 128)
+    }
+
+    /// Whether the pixel at (x, y) has any ink to speak of on it: it need not be dark,
+    /// only clearly not blank paper. The edge of a pen's line counts, and so does a
+    /// stroke that came out thinner than expected.
+    pub fn is_inked(&self, x: u32, y: u32) -> bool {
+        self.brightness(x, y).is_some_and(|brightness| brightness < 200)
+    }
+
+    /// How bright the pixel at (x, y) is, from 0 for black to 255 for white. None off the page.
+    fn brightness(&self, x: u32, y: u32) -> Option<u32> {
         if x >= self.width || y >= self.height {
-            return false;
+            return None;
         }
         let mut pixel = [0u8; 4];
         let offset = (y as u64 * self.width as u64 + x as u64) * 4;
         // Blue, green, red, alpha
-        self.memory.read_exact_at(&mut pixel, self.address + offset).is_ok() && (pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) < 3 * 128
+        self.memory.read_exact_at(&mut pixel, self.address + offset).ok()?;
+        Some((pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3)
     }
 }
 

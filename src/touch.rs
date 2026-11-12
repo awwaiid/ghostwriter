@@ -8,6 +8,7 @@ use tokio::time::sleep;
 
 use crate::cancellation::GhostwriterCancellation;
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
+use crate::pen::time_since_pen_lifted;
 use crate::screenshot::{ScreenProbe, Screenshot};
 use crate::simulation::{SimulationConfig, TouchSimulator};
 
@@ -21,6 +22,61 @@ pub enum PenTool {
     /// Another tool, by its place in the palette from the top: 2 is text, 3 the eraser, 4 selection
     Other(u32),
     Unknown,
+}
+
+/// How one of the palette's two pens is set up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PenSetup {
+    /// Which pen: 0 is the first in the palette, 1 the second
+    pub slot: u32,
+    /// The kind of pen, by its place among the nine in the pen's settings: 0 is the
+    /// ballpoint, 1 the fineliner
+    pub kind: u32,
+    /// The stroke size: 0 thin, 1 medium, 2 thick
+    pub size: u32,
+    /// The colour, by its place among the nine in the pen's settings: 0 is black
+    pub colour: u32,
+}
+
+impl PenSetup {
+    /// The second pen as a thin black fineliner.
+    pub const FINELINER_THIN: Self = Self {
+        slot: 1,
+        kind: 1,
+        size: 0,
+        colour: 0,
+    };
+
+    /// The first pen as a medium black ballpoint, which is how the tablet comes.
+    pub const BALLPOINT_MEDIUM: Self = Self {
+        slot: 0,
+        kind: 0,
+        size: 1,
+        colour: 0,
+    };
+}
+
+/// What `Touch::select_pen` changed, for `Touch::restore_pen` to put back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PenRestore {
+    /// The tool that was selected
+    pub tool: PenTool,
+    /// What the pen's kind, stroke size and colour were, each only if it was changed.
+    /// The size and colour are those of the kind of pen that was drawn with: every
+    /// kind keeps its own.
+    pub kind: Option<u32>,
+    pub size: Option<u32>,
+    pub colour: Option<u32>,
+}
+
+impl PenRestore {
+    /// Nothing was changed, so there is nothing to put back.
+    pub const NOTHING: Self = Self {
+        tool: PenTool::Unknown,
+        kind: None,
+        size: None,
+        colour: None,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,12 +141,14 @@ impl Palette {
     /// The tools run down the left edge from this height: pen 1, pen 2, text, eraser, selection
     const TOOLS_TOP: u32 = 112;
     const TOOLS: u32 = 5;
-    const PEN_1: u32 = 0;
-    const PEN_2: u32 = 1;
-    /// In a pen's settings, the left and top of its first stroke size (the thinnest of three
-    /// in a row) and of its first colour (black)
-    const SIZES: (u32, u32) = (144, 754);
-    const BLACK: (u32, u32) = (144, 932);
+    /// A pen's settings open beside it, their top level with the pen's own box. In them
+    /// are three rows of three kinds of pen, a row of three stroke sizes, and three rows
+    /// of three colours. This is the left of each first box, and how far below the top
+    /// of the settings the kinds, the sizes and the colours start.
+    const SETTINGS_LEFT: u32 = 144;
+    const KINDS_DOWN: u32 = 80;
+    const SIZES_DOWN: u32 = 530;
+    const COLOURS_DOWN: u32 = 708;
 
     fn new() -> Result<Self> {
         Ok(Self {
@@ -110,8 +168,24 @@ impl Palette {
         (0, Self::TOOLS_TOP + tool * Self::BOX)
     }
 
-    fn size_box(size: u32) -> (u32, u32) {
-        (Self::SIZES.0 + size * Self::BOX, Self::SIZES.1)
+    /// The box `place` places along a grid three wide, in the settings of the pen in `slot`.
+    fn settings_box(slot: u32, down: u32, place: u32) -> (u32, u32) {
+        (
+            Self::SETTINGS_LEFT + place % 3 * Self::BOX,
+            Self::tool_box(slot).1 + down + place / 3 * Self::BOX,
+        )
+    }
+
+    fn kind_box(slot: u32, kind: u32) -> (u32, u32) {
+        Self::settings_box(slot, Self::KINDS_DOWN, kind)
+    }
+
+    fn size_box(slot: u32, size: u32) -> (u32, u32) {
+        Self::settings_box(slot, Self::SIZES_DOWN, size)
+    }
+
+    fn colour_box(slot: u32, colour: u32) -> (u32, u32) {
+        Self::settings_box(slot, Self::COLOURS_DOWN, colour)
     }
 
     /// Which tool is selected, counting from 0 at the top. None while the palette is closed.
@@ -119,20 +193,30 @@ impl Palette {
         (0..Self::TOOLS).find(|&tool| self.is_filled(Self::tool_box(tool)))
     }
 
-    /// Whether a pen's settings are showing: a panel with a border down its right side
-    /// and white margins inside.
-    fn settings_showing(&self) -> bool {
-        let dark = |x, y| self.screen.is_dark(x, y);
-        dark(511, 500) && dark(511, 1000) && !dark(128, 500) && !dark(495, 720)
+    /// Whether the settings of the pen in `slot` are showing: a panel with a border down
+    /// its right side and white margins inside. Only the top of it is looked at, where
+    /// the kinds of pen are: what comes below depends on the kind.
+    fn settings_showing(&self, slot: u32) -> bool {
+        let top = Self::tool_box(slot).1;
+        let dark = |x, down| self.screen.is_dark(x, top + down);
+        dark(511, 100) && dark(511, 400) && !dark(128, 276) && !dark(495, 276)
     }
 
-    /// Which stroke size is selected, 0 being the thinnest. None unless a pen's settings are showing.
-    fn selected_size(&self) -> Option<u32> {
-        (0..3).find(|&size| self.settings_showing() && self.is_filled(Self::size_box(size)))
+    /// Which of the boxes in one part of a pen's settings is filled in. None unless the settings are showing.
+    fn selected(&self, slot: u32, down: u32, places: u32) -> Option<u32> {
+        (0..places).find(|&place| self.settings_showing(slot) && self.is_filled(Self::settings_box(slot, down, place)))
     }
 
-    fn black_is_selected(&self) -> bool {
-        self.settings_showing() && self.is_filled(Self::BLACK)
+    fn selected_kind(&self, slot: u32) -> Option<u32> {
+        self.selected(slot, Self::KINDS_DOWN, 9)
+    }
+
+    fn selected_size(&self, slot: u32) -> Option<u32> {
+        self.selected(slot, Self::SIZES_DOWN, 3)
+    }
+
+    fn selected_colour(&self, slot: u32) -> Option<u32> {
+        self.selected(slot, Self::COLOURS_DOWN, 9)
     }
 
     /// The middle of a box, in virtual page coordinates, for tapping it.
@@ -475,7 +559,12 @@ impl Touch {
         const HOLD: Duration = Duration::from_millis(40);
         // Long enough that a slow answer is not taken for none: a second tap would undo the first
         const PATIENCE: Duration = Duration::from_millis(1500);
+        // The tablet ignores touches until the pen has been gone this long
+        const AFTER_PEN: Duration = Duration::from_millis(300);
 
+        if let Some(wait) = time_since_pen_lifted().and_then(|since| AFTER_PEN.checked_sub(since)) {
+            sleep(wait).await;
+        }
         for _ in 0..2 {
             self.touch_start(xy).await?;
             sleep(HOLD).await;
@@ -493,58 +582,189 @@ impl Touch {
         anyhow::bail!("Tapping the tool palette at {xy:?} did not {what}")
     }
 
-    /// Select the second pen, thin and black, reading the palette off the screen after each
-    /// tap instead of allowing time for it. Returns the tool that was selected before.
-    async fn select_fineliner_watching(&mut self, palette: &Palette) -> Result<PenTool> {
-        let device_model = self.device_model();
-        let pen_2 = Palette::middle(Palette::tool_box(Palette::PEN_2), &device_model);
-
+    /// Open the palette, if it is closed.
+    async fn open_palette(&mut self, palette: &Palette) -> Result<()> {
         if palette.selected_tool().is_none() {
             self.tap_until(Self::PALETTE_BUTTON, "open the palette", || palette.selected_tool().is_some())
                 .await?;
         }
-        let previous = match palette.selected_tool() {
-            Some(Palette::PEN_1) => PenTool::Ballpoint,
-            Some(Palette::PEN_2) => PenTool::Fineliner,
+        Ok(())
+    }
+
+    async fn close_palette(&mut self, palette: &Palette) -> Result<()> {
+        self.tap_until(Self::PALETTE_BUTTON, "close the palette", || palette.selected_tool().is_none())
+            .await
+    }
+
+    /// With the palette open, select the pen in `slot` and show its settings.
+    async fn open_pen_settings(&mut self, palette: &Palette, slot: u32) -> Result<()> {
+        let pen = Palette::middle(Palette::tool_box(slot), &self.device_model());
+        if palette.selected_tool() != Some(slot) {
+            self.tap_until(pen, "select the pen", || palette.selected_tool() == Some(slot)).await?;
+        }
+        // Tapping the selected pen opens its settings
+        if !palette.settings_showing(slot) {
+            self.tap_until(pen, "open the pen's settings", || palette.settings_showing(slot)).await?;
+        }
+        Ok(())
+    }
+
+    /// With a pen's settings showing, choose its kind. Returns the kind it was, if that was another.
+    async fn choose_kind(&mut self, palette: &Palette, slot: u32, kind: u32) -> Result<Option<u32>> {
+        let before = palette.selected_kind(slot);
+        if before == Some(kind) {
+            return Ok(None);
+        }
+        let device_model = self.device_model();
+        let kind_box = Palette::middle(Palette::kind_box(slot, kind), &device_model);
+        // On some firmware choosing a kind closes the settings, which then need opening again to see it
+        self.tap_until(kind_box, "choose the kind of pen", || {
+            palette.selected_kind(slot) == Some(kind) || !palette.settings_showing(slot)
+        })
+        .await?;
+        // The settings are laid out afresh for the new kind; give that a moment to finish
+        sleep(Duration::from_millis(150)).await;
+        if !palette.settings_showing(slot) {
+            let pen = Palette::middle(Palette::tool_box(slot), &device_model);
+            self.tap_until(pen, "open the pen's settings again", || palette.settings_showing(slot)).await?;
+        }
+        anyhow::ensure!(palette.selected_kind(slot) == Some(kind), "The palette did not change the kind of pen");
+        Ok(before)
+    }
+
+    /// With a pen's settings showing, choose its stroke size. Returns the size it was, if that was another.
+    async fn choose_size(&mut self, palette: &Palette, slot: u32, size: u32) -> Result<Option<u32>> {
+        let before = palette.selected_size(slot);
+        if before == Some(size) {
+            return Ok(None);
+        }
+        let size_box = Palette::middle(Palette::size_box(slot, size), &self.device_model());
+        self.tap_until(size_box, "choose the stroke size", || palette.selected_size(slot) == Some(size))
+            .await?;
+        Ok(before)
+    }
+
+    /// With a pen's settings showing, choose its colour. Returns the colour it was, if that was another.
+    async fn choose_colour(&mut self, palette: &Palette, slot: u32, colour: u32) -> Result<Option<u32>> {
+        let before = palette.selected_colour(slot);
+        if before == Some(colour) {
+            return Ok(None);
+        }
+        let colour_box = Palette::middle(Palette::colour_box(slot, colour), &self.device_model());
+        self.tap_until(colour_box, "choose the colour", || palette.selected_colour(slot) == Some(colour))
+            .await?;
+        Ok(before)
+    }
+
+    /// Select a pen and set it up, reading the palette off the screen after each tap
+    /// instead of allowing time for it.
+    async fn select_pen_watching(&mut self, palette: &Palette, wanted: PenSetup) -> Result<PenRestore> {
+        self.open_palette(palette).await?;
+        let tool = match palette.selected_tool() {
+            Some(0) => PenTool::Ballpoint,
+            Some(1) => PenTool::Fineliner,
             Some(tool) => PenTool::Other(tool),
             None => PenTool::Unknown,
         };
+        self.open_pen_settings(palette, wanted.slot).await?;
+        let restore = PenRestore {
+            tool,
+            kind: self.choose_kind(palette, wanted.slot, wanted.kind).await?,
+            size: self.choose_size(palette, wanted.slot, wanted.size).await?,
+            colour: self.choose_colour(palette, wanted.slot, wanted.colour).await?,
+        };
+        self.close_palette(palette).await?;
 
-        if palette.selected_tool() != Some(Palette::PEN_2) {
-            self.tap_until(pen_2, "select the second pen", || palette.selected_tool() == Some(Palette::PEN_2))
-                .await?;
-        }
-        // Tapping the selected pen opens its settings
-        if !palette.settings_showing() {
-            self.tap_until(pen_2, "open the pen's settings", || palette.settings_showing()).await?;
-        }
-        if palette.selected_size() != Some(0) {
-            let thin = Palette::middle(Palette::size_box(0), &device_model);
-            self.tap_until(thin, "select the thin stroke", || palette.selected_size() == Some(0)).await?;
-        }
-        if !palette.black_is_selected() {
-            let black = Palette::middle(Palette::BLACK, &device_model);
-            self.tap_until(black, "select black", || palette.black_is_selected()).await?;
+        info!("Selected the pen {:?}; to put back: {:?}", wanted, restore);
+        Ok(restore)
+    }
+
+    /// Put back what `select_pen_watching` changed.
+    async fn restore_pen_watching(&mut self, palette: &Palette, pen: PenSetup, restore: PenRestore) -> Result<()> {
+        let tool = match restore.tool {
+            PenTool::Ballpoint => Some(0),
+            PenTool::Fineliner => Some(1),
+            PenTool::Other(tool) => Some(tool),
+            PenTool::Unknown => None,
+        };
+        let pen_changed = restore.kind.is_some() || restore.size.is_some() || restore.colour.is_some();
+        if !pen_changed && tool.is_none_or(|tool| tool == pen.slot) {
+            return Ok(());
         }
 
-        self.tap_until(Self::PALETTE_BUTTON, "close the palette", || palette.selected_tool().is_none())
-            .await?;
-        info!("select_fineliner: done, previous={:?}", previous);
-        Ok(previous)
+        self.open_palette(palette).await?;
+        if pen_changed {
+            self.open_pen_settings(palette, pen.slot).await?;
+            // The size and colour belong to the kind of pen that was drawn with, so they go back first
+            if let Some(size) = restore.size {
+                self.choose_size(palette, pen.slot, size).await?;
+            }
+            if let Some(colour) = restore.colour {
+                self.choose_colour(palette, pen.slot, colour).await?;
+            }
+            if let Some(kind) = restore.kind {
+                self.choose_kind(palette, pen.slot, kind).await?;
+            }
+        }
+        if let Some(tool) = tool.filter(|&tool| palette.selected_tool() != Some(tool)) {
+            let middle = Palette::middle(Palette::tool_box(tool), &self.device_model());
+            self.tap_until(middle, "select the tool", || palette.selected_tool() == Some(tool)).await?;
+        }
+        self.close_palette(palette).await
     }
 
     /// Select a tool by its place in the palette, reading the palette off the screen after each tap.
     async fn select_tool_watching(&mut self, palette: &Palette, tool: u32) -> Result<()> {
-        if palette.selected_tool().is_none() {
-            self.tap_until(Self::PALETTE_BUTTON, "open the palette", || palette.selected_tool().is_some())
-                .await?;
-        }
+        self.open_palette(palette).await?;
         if palette.selected_tool() != Some(tool) {
             let middle = Palette::middle(Palette::tool_box(tool), &self.device_model());
             self.tap_until(middle, "select the tool", || palette.selected_tool() == Some(tool)).await?;
         }
-        self.tap_until(Self::PALETTE_BUTTON, "close the palette", || palette.selected_tool().is_none())
-            .await
+        self.close_palette(palette).await
+    }
+
+    /// Whether the tool palette is open, read off the screen. Only on a Paper Pro.
+    pub fn palette_is_open() -> Result<bool> {
+        Ok(Palette::new()?.selected_tool().is_some())
+    }
+
+    /// Tap the button that opens and closes the tool palette, once, without waiting to see what comes of it.
+    pub async fn tap_palette_button(&mut self) -> Result<()> {
+        self.touch_start(Self::PALETTE_BUTTON).await?;
+        sleep(Duration::from_millis(40)).await;
+        self.touch_stop().await
+    }
+
+    /// Select one of the palette's pens and set it up for drawing. Returns what was
+    /// changed, for `restore_pen` to put back afterwards.
+    ///
+    /// On a Paper Pro the palette is read off the screen, which is quick and sure. On
+    /// other devices, and if that fails, the second pen is selected by timed taps, and
+    /// only as a thin black fineliner.
+    pub async fn select_pen(&mut self, wanted: PenSetup) -> Result<PenRestore> {
+        if let Ok(palette) = Palette::new() {
+            match self.select_pen_watching(&palette, wanted).await {
+                Ok(restore) => return Ok(restore),
+                Err(e) => info!("{}; selecting the pen by timed taps instead", e),
+            }
+        }
+        anyhow::ensure!(
+            wanted == PenSetup::FINELINER_THIN,
+            "Only the thin fineliner can be selected without reading the palette off the screen"
+        );
+        let tool = self.select_fineliner_by_timed_taps().await?;
+        Ok(PenRestore { tool, ..PenRestore::NOTHING })
+    }
+
+    /// Put back the tool, and the pen's settings, that `select_pen` changed.
+    pub async fn restore_pen(&mut self, pen: PenSetup, restore: PenRestore) -> Result<()> {
+        if let Ok(palette) = Palette::new() {
+            match self.restore_pen_watching(&palette, pen, restore).await {
+                Ok(()) => return Ok(()),
+                Err(e) => info!("{}; restoring the tool by timed taps instead", e),
+            }
+        }
+        self.restore_tool(restore.tool).await
     }
 
     fn device_model(&self) -> DeviceModel {
@@ -554,24 +774,21 @@ impl Touch {
         }
     }
 
-    /// Select fineliner pen with correct tip type, medium size, and black color.
+    /// Select the second pen as a thin black fineliner. Returns the tool that was selected before.
+    pub async fn select_fineliner(&mut self) -> Result<PenTool> {
+        Ok(self.select_pen(PenSetup::FINELINER_THIN).await?.tool)
+    }
+
+    /// Select fineliner pen with thin size and black color, without being able to see the palette.
     ///
     /// Robust algorithm that does not rely on knowing the current state:
     /// 1. Open palette (toggle if closed)
     /// 2. Tap ballpoint sidebar icon → guarantees ballpoint is now active
     /// 3. Tap fineliner sidebar icon → selects it (since ballpoint was active, this just selects)
     /// 4. Tap fineliner sidebar icon again → opens its settings (it's now active)
-    /// 5. Configure: fineliner tip, medium size, black color
+    /// 5. Configure: thin size, black color
     /// 6. Close palette
-    pub async fn select_fineliner(&mut self) -> Result<PenTool> {
-        // On a Paper Pro the palette can be read off the screen, which is quicker and surer
-        if let Ok(palette) = Palette::new() {
-            match self.select_fineliner_watching(&palette).await {
-                Ok(previous) => return Ok(previous),
-                Err(e) => info!("{}; selecting the pen by timed taps instead", e),
-            }
-        }
-
+    async fn select_fineliner_by_timed_taps(&mut self) -> Result<PenTool> {
         // Read current state so we can return the previous tool
         let (palette_open, previous) = self.read_tool_state().await;
 
@@ -613,7 +830,7 @@ impl Touch {
         let place = match target {
             PenTool::Fineliner => return self.select_fineliner().await,
             PenTool::Unknown => return Ok(PenTool::Unknown),
-            PenTool::Ballpoint => Palette::PEN_1,
+            PenTool::Ballpoint => 0,
             PenTool::Other(place) => place,
         };
 

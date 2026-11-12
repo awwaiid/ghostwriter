@@ -3,12 +3,14 @@ use evdev::EventType as EvdevEventType;
 use evdev::{Device, InputEvent};
 use log::{debug, info};
 use resvg::usvg;
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::screenshot::{ScreenProbe, Screenshot};
 use crate::stroke_plan::{plan_strokes, watch_pixels, PenModel};
+use crate::touch::PenSetup;
 use crate::util::{parse_svg, svg_to_alpha_bitmap};
 
 /// One continuous pen stroke.
@@ -33,9 +35,22 @@ pub struct StrokeTiming {
     pub points_per_pause: usize,
 }
 
+impl StrokeTiming {
+    /// Under 1000 strokes a second, for when the screen cannot be watched to see how
+    /// the device is keeping up. A Paper Pro on firmware 3.29 draws about 2000 a second
+    /// and pauses now and then for tens of milliseconds, so this leaves it room: sent
+    /// more than it can take, strokes are lost and others run into each other.
+    pub fn unwatched() -> Self {
+        Self {
+            after_up: Duration::from_micros(900),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for StrokeTiming {
-    /// About 2000 strokes a second, for when the screen cannot be watched. A Paper Pro on
-    /// firmware 3.29 draws up to about 2500 a second, and loses them when sent more.
+    /// About 2000 strokes a second, which is as fast as a Paper Pro on firmware 3.29
+    /// draws them when all is well.
     fn default() -> Self {
         Self {
             after_down: Duration::ZERO,
@@ -48,6 +63,56 @@ impl Default for StrokeTiming {
 
 /// The pressure of a firm stroke. (The digitizers report up to about 4096.)
 pub const FULL_PRESSURE: i32 = 2630;
+
+/// When any `Pen` in this process last lifted off the page.
+static LAST_LIFTED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long ago the pen last lifted off the page, if it has drawn at all.
+///
+/// The tablet ignores touches while a pen is about, and goes on ignoring them for a
+/// little under a quarter of a second after it has gone (measured on a Paper Pro,
+/// firmware 3.29: a tap 220 ms after the pen is lost, one at 240 ms is taken).
+pub fn time_since_pen_lifted() -> Option<Duration> {
+    LAST_LIFTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .map(|lifted| lifted.elapsed())
+}
+
+/// The pens ghostwriter can draw with: the ones whose strokes have been measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DrawingPen {
+    /// The second pen in the palette, as a thin black fineliner
+    Fineliner,
+    /// The first pen in the palette, as a medium black ballpoint
+    Ballpoint,
+}
+
+impl DrawingPen {
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_lowercase().as_str() {
+            "fineliner" => Ok(Self::Fineliner),
+            "ballpoint" => Ok(Self::Ballpoint),
+            other => anyhow::bail!("Unknown pen {other}: use fineliner or ballpoint"),
+        }
+    }
+
+    /// How the pen's strokes come out, for planning a drawing.
+    pub fn model(self) -> PenModel {
+        match self {
+            Self::Fineliner => PenModel::FINELINER_THIN,
+            Self::Ballpoint => PenModel::BALLPOINT_MEDIUM,
+        }
+    }
+
+    /// How the pen is set up in the palette, for selecting it.
+    pub fn setup(self) -> PenSetup {
+        match self {
+            Self::Fineliner => PenSetup::FINELINER_THIN,
+            Self::Ballpoint => PenSetup::BALLPOINT_MEDIUM,
+        }
+    }
+}
 
 /// How an SVG is to be drawn on a device. Working it out takes a few tenths of a
 /// second, which can be spent while something else is going on.
@@ -213,6 +278,7 @@ impl Pen {
                 InputEvent::new(EvdevEventType::KEY.0, 320, 0),           // BTN_TOOL_PEN
                 InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
             ])?;
+            *LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
         }
         Ok(())
     }
@@ -609,26 +675,71 @@ impl Pen {
 
     /// Draw an SVG on the page with `pen`, the pen that is selected on the device.
     pub fn draw_svg(&mut self, svg_data: &str, pen: PenModel) -> Result<()> {
-        self.draw(&Drawing::plan(svg_data, self.device_model, pen)?)
+        self.draw(&Drawing::plan(svg_data, self.device_model, pen)?, false)?;
+        Ok(())
     }
 
     /// Draw what was planned for an SVG.
-    pub fn draw(&mut self, drawing: &Drawing) -> Result<()> {
+    ///
+    /// With `check_pen`, the first stroke is drawn on its own and looked at. If it has
+    /// not come out the way the pen the drawing was planned for would draw it, nothing
+    /// more is drawn and this returns false: some other tool is selected. (Where the
+    /// screen cannot be watched there is no telling, and the whole drawing is drawn.)
+    pub fn draw(&mut self, drawing: &Drawing, check_pen: bool) -> Result<bool> {
         match drawing {
             Drawing::Strokes { strokes, pen } => {
                 self.tail = pen.tail;
                 let drawn = match Screenshot::new().and_then(|mut screenshot| screenshot.probe()) {
-                    Ok(screen) => self.draw_strokes_watched(strokes, &screen, pen),
+                    Ok(screen) => self.draw_strokes_watched(strokes, &screen, pen, check_pen),
                     Err(e) => {
                         info!("Drawing without watching the screen: {}", e);
-                        self.draw_strokes(strokes, &StrokeTiming::default())
+                        self.draw_strokes(strokes, &StrokeTiming::unwatched()).map(|()| true)
                     }
                 };
                 self.tail = 0.0;
                 drawn
             }
-            Drawing::Rows { alpha, scale } => self.draw_bitmap_alpha_pressure(alpha, *scale),
+            Drawing::Rows { alpha, scale } => self.draw_bitmap_alpha_pressure(alpha, *scale).map(|()| true),
         }
+    }
+
+    /// Draw one stroke and see whether it came out the way `pen` draws: there at all, and
+    /// no wider. An eraser or the text tool leaves nothing; a marker or a highlighter
+    /// leaves too much.
+    fn first_stroke_is_as_planned(&mut self, stroke: &Stroke, watch: (u32, u32), screen: &ScreenProbe, pen: &PenModel) -> Result<bool> {
+        const PATIENCE: Duration = Duration::from_millis(400);
+
+        // Two pixels well clear of either side of the stroke's middle, which this pen leaves alone
+        let (width, height) = self.device_model.page_size();
+        let to_pixels = |(x, y): (f32, f32)| (x * width as f32 / VIRTUAL_WIDTH as f32, y * height as f32 / VIRTUAL_HEIGHT as f32);
+        let (from, to) = (to_pixels(stroke.points[0]), to_pixels(stroke.points[stroke.points.len() - 1]));
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = dx.hypot(dy).max(f32::MIN_POSITIVE);
+        let clear = pen.rows as f32 / 2.0 + 2.5;
+        let beside: Vec<(u32, u32)> = [clear, -clear]
+            .iter()
+            .map(|side| ((from.0 + to.0) / 2.0 + dy / length * side, (from.1 + to.1) / 2.0 - dx / length * side))
+            .filter(|&(x, y)| x >= 0.0 && y >= 0.0)
+            .map(|(x, y)| (x as u32, y as u32))
+            .filter(|&(x, y)| !screen.is_inked(x, y))
+            .collect();
+
+        self.draw_stroke(stroke, &StrokeTiming::default())?;
+        let drawn_at = Instant::now();
+        while !screen.is_inked(watch.0, watch.1) {
+            if drawn_at.elapsed() > PATIENCE {
+                info!("The first stroke left no ink");
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(1));
+        }
+        // The whole of the stroke is on the screen a moment after its middle
+        sleep(Duration::from_millis(5));
+        if beside.iter().any(|&(x, y)| screen.is_inked(x, y)) {
+            info!("The first stroke came out wider than the pen it was planned for");
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Draw strokes as fast as the device takes them, watching the screen to see how far
@@ -639,16 +750,20 @@ impl Pen {
     /// the events of a 67th stroke arrive before it has caught up, the kernel throws away
     /// everything it was holding, and those strokes are never drawn. So strokes are only
     /// sent a little way ahead of the last one seen on the screen.
-    pub fn draw_strokes_watched(&mut self, strokes: &[Stroke], screen: &ScreenProbe, pen: &PenModel) -> Result<()> {
+    ///
+    /// With `check_pen`, the first stroke is drawn alone and looked at first, and if it
+    /// is not what `pen` would have drawn the rest is left undrawn and this returns false.
+    pub fn draw_strokes_watched(&mut self, strokes: &[Stroke], screen: &ScreenProbe, pen: &PenModel, check_pen: bool) -> Result<bool> {
         const ROUNDS: usize = 3;
+        const STRAGGLERS: Duration = Duration::from_millis(300);
 
         let started = Instant::now();
         // Ink that is already on the page says nothing about a new stroke
         let watched: Vec<Option<(u32, u32)>> = watch_pixels(strokes, self.device_model.page_size(), pen)
             .into_iter()
-            .map(|pixel| pixel.filter(|&(x, y)| !screen.is_dark(x, y)))
+            .map(|pixel| pixel.filter(|&(x, y)| !screen.is_inked(x, y)))
             .collect();
-        let shows = |index: usize| watched[index].is_some_and(|(x, y)| screen.is_dark(x, y));
+        let shows = |index: usize| watched[index].is_some_and(|(x, y)| screen.is_inked(x, y));
 
         info!(
             "Chose pixels to watch for {} of {} strokes in {:?}",
@@ -658,20 +773,52 @@ impl Pen {
         );
 
         let mut to_draw: Vec<usize> = (0..strokes.len()).collect();
+        if check_pen {
+            // A stroke that can be watched, and is long enough to have a middle
+            let long_enough = |stroke: &Stroke| {
+                let (first, last) = (stroke.points[0], stroke.points[stroke.points.len() - 1]);
+                (first.0 - last.0).hypot(first.1 - last.1) >= 2.0
+            };
+            let first = (0..strokes.len()).find(|&index| watched[index].is_some() && long_enough(&strokes[index]));
+            let Some((first, watch)) = first.and_then(|first| Some((first, watched[first]?))) else {
+                info!("No stroke of this drawing would show whether the pen is the one it was planned for");
+                return Ok(false);
+            };
+            if !self.first_stroke_is_as_planned(&strokes[first], watch, screen, pen)? {
+                return Ok(false);
+            }
+            to_draw.retain(|&index| index != first);
+        }
         for _ in 0..ROUNDS {
             let started = Instant::now();
             if !self.send_watched(strokes, &to_draw, &watched, &shows)? {
                 // The screen is not showing what is drawn, so there is nothing to check
-                return Ok(());
+                return Ok(true);
             }
             info!("Drew {} strokes in {:?}", to_draw.len(), started.elapsed());
             to_draw.retain(|&index| watched[index].is_some() && !shows(index));
+            // Some strokes show a little after later ones do. Drawn again they would
+            // come out heavier, so give the stragglers a moment first.
+            let waiting_since = Instant::now();
+            while !to_draw.is_empty() && waiting_since.elapsed() < STRAGGLERS {
+                sleep(Duration::from_millis(20));
+                to_draw.retain(|&index| !shows(index));
+            }
             if to_draw.is_empty() {
                 break;
             }
             info!("Drawing {} strokes again that did not arrive", to_draw.len());
+            for &index in to_draw.iter().take(12) {
+                debug!(
+                    "  stroke {} of {}: {:?}, watched at {:?}",
+                    index,
+                    strokes.len(),
+                    strokes[index].points,
+                    watched[index]
+                );
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Send the strokes listed in `order`, keeping no more than a window of them ahead of
@@ -682,14 +829,18 @@ impl Pen {
         // queue with room to spare.
         const WINDOW: usize = 48;
         const POLL: Duration = Duration::from_micros(100);
-        // Strokes with nothing to watch for are given time instead
-        const UNWATCHED: Duration = Duration::from_micros(400);
-        // The longest pause seen in xochitl was under 40 milliseconds
+        // Strokes with nothing to watch for are given time instead, a little more than
+        // xochitl takes over a stroke
+        const UNWATCHED: Duration = Duration::from_micros(550);
+        // The longest pause seen in xochitl was 120 milliseconds
         const STALLED: Duration = Duration::from_millis(500);
+        // How many times running a window of strokes may fail to show before giving up on the screen
+        const STALLS_ALLOWED: usize = 3;
         const LAST_ONES: Duration = Duration::from_millis(300);
 
         // order[..seen] have been read by xochitl
         let mut seen = 0;
+        let mut stalls = 0;
         let started = Instant::now();
         for sent in 0..order.len() {
             if sent % 500 == 0 {
@@ -701,14 +852,22 @@ impl Pen {
                 if let Some(newest_showing) = (seen..sent).rev().find(|&at| shows(order[at])) {
                     seen = newest_showing + 1;
                     waiting_since = None;
+                    stalls = 0;
                 } else if !(seen..sent).any(|at| watched[order[at]].is_some()) {
                     sleep(UNWATCHED);
                     seen += 1;
                 } else if waiting_since.get_or_insert_with(Instant::now).elapsed() > STALLED {
-                    info!("The screen is not showing the strokes being drawn; no longer watching it");
-                    let rest: Vec<Stroke> = order[sent..].iter().map(|&index| strokes[index].clone()).collect();
-                    self.draw_strokes(&rest, &StrokeTiming::default())?;
-                    return Ok(false);
+                    // Whatever became of those strokes, xochitl has had time to read them
+                    stalls += 1;
+                    if stalls >= STALLS_ALLOWED {
+                        info!("The screen is not showing the strokes being drawn; no longer watching it");
+                        let rest: Vec<Stroke> = order[sent..].iter().map(|&index| strokes[index].clone()).collect();
+                        self.draw_strokes(&rest, &StrokeTiming::unwatched())?;
+                        return Ok(false);
+                    }
+                    debug!("None of {} strokes showed; carrying on", sent - seen);
+                    seen = sent;
+                    waiting_since = None;
                 } else {
                     sleep(POLL);
                 }
