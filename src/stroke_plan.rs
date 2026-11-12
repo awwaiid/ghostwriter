@@ -13,16 +13,19 @@
 //!   Sent faster than it takes them, they are lost a queue-full at a time (see
 //!   `Pen::draw_strokes_watched`).
 //!
-//! So shapes are filled with crisp bars, each inking a few whole rows or columns of
-//! pixels, which reproduces the rendered SVG pixel for pixel. Lines too thin for a bar
-//! are drawn along their middle, the way a person would draw them.
+//! So the lines of the SVG that slant or curve are followed along their length, as a
+//! pen would (see `path_strokes`). Everything else is filled with crisp bars, each
+//! inking a few whole rows or columns of pixels, which reproduces the rendered SVG
+//! pixel for pixel. What is too thin for a bar is drawn along its middle.
 
 use anyhow::Result;
+use log::debug;
 
 use crate::device::{VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
+use crate::path_strokes;
 use crate::pen::{Stroke, FULL_PRESSURE};
 use crate::skeleton;
-use crate::util::svg_to_alpha_bitmap;
+use crate::util::{parse_svg, svg_to_alpha_bitmap, tree_to_alpha_bitmap};
 
 /// What planning needs to know about a pen: how its strokes come out on the device.
 ///
@@ -55,7 +58,7 @@ impl PenModel {
     pub const BALLPOINT_MEDIUM: Self = Self { rows: 3, tail: 0.3 };
 
     /// How far a stroke's ink carries on past each of its ends, in pixels.
-    const PAST_END: f32 = 1.0;
+    pub(crate) const PAST_END: f32 = 1.0;
 
     /// The shortest run of pixels a bar can cover: a pixel of travel, and what is inked past each end.
     const SHORTEST_BAR: usize = 3;
@@ -93,10 +96,10 @@ const MIN_STROKE: f32 = 1.0;
 const MIN_THIN_FEATURE: usize = 6;
 
 /// A point in device pixels. Pixel (i, j) covers i..i+1 by j..j+1.
-type Point = (f32, f32);
+pub(crate) type Point = (f32, f32);
 
 /// A straight stroke between two points.
-type Segment = (Point, Point);
+pub(crate) type Segment = (Point, Point);
 
 /// A grid of true/false values, one per device pixel.
 #[derive(Clone)]
@@ -131,12 +134,42 @@ impl Grid {
     /// The same grid with rows and columns swapped.
     fn transposed(&self) -> Grid {
         let mut transposed = Grid::new(self.height, self.width);
-        for y in 0..self.height {
-            for x in 0..self.width {
-                transposed.cells[x * self.height + y] = self.cells[y * self.width + x];
-            }
+        // Most of a page is blank, so only the true cells are worth a visit
+        for (index, _) in self.cells.iter().enumerate().filter(|(_, &cell)| cell) {
+            let (x, y) = (index % self.width, index / self.width);
+            transposed.cells[x * self.height + y] = true;
         }
         transposed
+    }
+
+    /// The part of the grid `width` by `height` cells from (left, top).
+    fn cropped(&self, left: usize, top: usize, width: usize, height: usize) -> Grid {
+        let cells = (top..top + height)
+            .flat_map(|y| self.cells[y * self.width + left..y * self.width + left + width].iter().copied())
+            .collect();
+        Grid { width, height, cells }
+    }
+
+    /// The first and last true cell of each row, for rows that have any.
+    fn row_spans(&self) -> Vec<Option<(usize, usize)>> {
+        self.cells
+            .chunks(self.width.max(1))
+            .map(|row| {
+                let first = row.iter().position(|&cell| cell)?;
+                let last = row.iter().rposition(|&cell| cell)?;
+                Some((first, last))
+            })
+            .collect()
+    }
+
+    /// The smallest box holding every true cell, as (left, top, width, height).
+    fn bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        let spans = self.row_spans();
+        let top = spans.iter().position(Option::is_some)?;
+        let bottom = spans.iter().rposition(Option::is_some)?;
+        let left = spans.iter().flatten().map(|span| span.0).min()?;
+        let right = spans.iter().flatten().map(|span| span.1).max()?;
+        Some((left, top, right - left + 1, bottom - top + 1))
     }
 
     /// Cells that are true here and false in `other`.
@@ -212,15 +245,51 @@ impl Grid {
 /// The strokes are in virtual page coordinates, ready for `Pen::draw_strokes`.
 pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Result<Vec<Stroke>> {
     let (width, height) = (page_size.0 as usize, page_size.1 as usize);
-    let coverage = svg_to_alpha_bitmap(svg_data, page_size.0, page_size.1)?;
+    let started = std::time::Instant::now();
+    // An SVG that cannot be read is drawn as a marker saying so, which has no lines to follow
+    let parsed = parse_svg(svg_data);
+    debug!("Parsed the SVG after {:?}", started.elapsed());
+    let (coverage, lines) = match parsed {
+        Ok(tree) => {
+            let coverage = tree_to_alpha_bitmap(&tree, page_size.0, page_size.1)?;
+            debug!("Rendered it after {:?}", started.elapsed());
+            (coverage, path_strokes::along_paths(&tree, page_size, pen))
+        }
+        Err(_) => (svg_to_alpha_bitmap(svg_data, page_size.0, page_size.1)?, Vec::new()),
+    };
     let ink = Grid {
         width,
         height,
         cells: coverage.iter().flat_map(|row| row.iter().map(|&alpha| alpha >= 128)).collect(),
     };
+    debug!("Followed its lines after {:?}", started.elapsed());
+
+    // The lines first, and then whatever they leave bare
+    let mut covered = Grid::new(width, height);
+    for &(from, to) in &lines {
+        for_each_inked_pixel_of(from, to, page_size, pen, |x, y, _, _| covered.set(x, y, true));
+    }
+    let mut strokes = lines;
+    let along_lines = strokes.len();
+    // The rest is planned within the part of the page that has ink on it, which is
+    // usually a small part
+    if let Some((left, top, width, height)) = ink.bounds() {
+        let ink = ink.cropped(left, top, width, height);
+        let mut covered = covered.cropped(left, top, width, height);
+        drop_slivers(&ink, &mut covered);
+        debug!("Marked what they ink after {:?}", started.elapsed());
+        let on_page = |(x, y): Point| (x + left as f32, y + top as f32);
+        strokes.extend(plan_ink(&ink, covered, pen).into_iter().map(|(from, to)| (on_page(from), on_page(to))));
+    }
+    debug!(
+        "{} strokes along lines and {} for the rest, after {:?}",
+        along_lines,
+        strokes.len() - along_lines,
+        started.elapsed()
+    );
 
     let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
-    Ok(plan_ink(&ink, pen)
+    Ok(strokes
         .into_iter()
         .map(|(from, to)| Stroke {
             points: vec![to_virtual(from), to_virtual(to)],
@@ -229,8 +298,28 @@ pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
         .collect())
 }
 
-/// Plan the strokes that ink the true cells of a grid, in pixels.
-fn plan_ink(ink: &Grid, pen: &PenModel) -> Vec<Segment> {
+/// Count as covered the bare ink that is only a pixel thick along the edge of what is
+/// covered already. The pen's line and the rendered line rarely agree to the pixel
+/// about where a slanting edge is, and those slivers are not worth a stroke each.
+fn drop_slivers(ink: &Grid, covered: &mut Grid) {
+    let bare = |x: isize, y: isize| ink.at(x, y) && !covered.at(x, y);
+    let mut slivers = Vec::new();
+    for (index, _) in ink.cells.iter().enumerate().filter(|&(index, &cell)| cell && !covered.cells[index]) {
+        let (x, y) = ((index % ink.width) as isize, (index / ink.width) as isize);
+        let beside_covered = (-1..=1).any(|dy| (-1..=1).any(|dx| covered.at(x + dx, y + dy)));
+        // Part of some two-by-two block of bare ink, or not
+        let has_substance = (-1..=0).any(|dy| (-1..=0).any(|dx| (0..=1).all(|by| (0..=1).all(|bx| bare(x + dx + bx, y + dy + by)))));
+        if beside_covered && !has_substance {
+            slivers.push((x as usize, y as usize));
+        }
+    }
+    for (x, y) in slivers {
+        covered.set(x, y, true);
+    }
+}
+
+/// Plan the strokes that ink the true cells of a grid that are not `covered` already, in pixels.
+fn plan_ink(ink: &Grid, mut covered: Grid, pen: &PenModel) -> Vec<Segment> {
     let mut strokes = Vec::new();
 
     // Bars run along whichever direction gives the longer bar at each pixel...
@@ -243,7 +332,6 @@ fn plan_ink(ink: &Grid, pen: &PenModel) -> Vec<Segment> {
             prefers_across.set(x, y, ink.get(x, y) && across[y * ink.width + x] >= down[x * ink.height + y]);
         }
     }
-    let mut covered = Grid::new(ink.width, ink.height);
     strokes.extend(bars(ink, &prefers_across, &mut covered, pen));
 
     // ...and then the other direction, and the first again, mop up
@@ -294,18 +382,28 @@ fn bars(ink: &Grid, wanted: &Grid, covered: &mut Grid, pen: &PenModel) -> Vec<Se
     // Going down the page, a bar whose top row is `top` is the last chance to ink that
     // row, so that is where a bar goes. The rows below are inked along with it, and
     // only need this bar for themselves where no bar can start lower down.
+    let spans = ink.row_spans();
     for top in 0..=ink.height - rows {
+        // Only as far across as all of these rows have ink
+        let Some((first, last)) = spans[top..top + rows]
+            .iter()
+            .copied()
+            .reduce(|a, b| Some((a?.0.max(b?.0), a?.1.min(b?.1))))
+            .flatten()
+        else {
+            continue;
+        };
         let all_rows = |x: usize| (top..top + rows).all(|y| ink.get(x, y));
         let no_lower_bar = |x: usize| top + rows >= ink.height || !ink.get(x, top + rows);
 
-        let mut x = 0;
-        while x < ink.width {
+        let mut x = first;
+        while x <= last {
             if !all_rows(x) {
                 x += 1;
                 continue;
             }
             let run_start = x;
-            while x < ink.width && all_rows(x) {
+            while x <= last && all_rows(x) {
                 x += 1;
             }
             let run_end = x;
@@ -515,19 +613,37 @@ fn to_pixels((x, y): Point, page_size: (u32, u32)) -> Point {
 /// is from the stroke's line, and how far along the line it is (0 at the start, 1 at the
 /// end, beyond those past the ends). A pixel on two parts of a stroke is visited twice.
 fn for_each_inked_pixel(stroke: &Stroke, page_size: (u32, u32), pen: &PenModel, mut visit: impl FnMut(usize, usize, f32, f32)) {
-    let (width, height) = (page_size.0 as usize, page_size.1 as usize);
-    let margin = pen.half_width().max(PenModel::PAST_END);
     for pair in stroke.points.windows(2) {
-        let (from, to) = (to_pixels(pair[0], page_size), to_pixels(pair[1], page_size));
-        let first_x = (from.0.min(to.0) - margin).floor().max(0.0) as usize;
-        let last_x = ((from.0.max(to.0) + margin).ceil() as usize).min(width.saturating_sub(1));
-        let first_y = (from.1.min(to.1) - margin).floor().max(0.0) as usize;
-        let last_y = ((from.1.max(to.1) + margin).ceil() as usize).min(height.saturating_sub(1));
-        for y in first_y..=last_y {
-            for x in first_x..=last_x {
-                if let Some((from_line, along)) = pen.inks(from, to, (x as f32 + 0.5, y as f32 + 0.5)) {
-                    visit(x, y, from_line, along);
-                }
+        for_each_inked_pixel_of(to_pixels(pair[0], page_size), to_pixels(pair[1], page_size), page_size, pen, &mut visit);
+    }
+}
+
+/// The same, for one straight stroke between two points in device pixels.
+fn for_each_inked_pixel_of(from: Point, to: Point, page_size: (u32, u32), pen: &PenModel, mut visit: impl FnMut(usize, usize, f32, f32)) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    // Go along the stroke the long way, a column of pixels at a time (or a row, for a
+    // steep stroke), looking only at the few pixels in each that are near its line
+    let steep = dy.abs() > dx.abs();
+    let (from_a, from_b, to_a, to_b) = if steep { (from.1, from.0, to.1, to.0) } else { (from.0, from.1, to.0, to.1) };
+    let (size_a, size_b) = if steep { (page_size.1, page_size.0) } else { (page_size.0, page_size.1) };
+    let slope = (to_b - from_b) / (to_a - from_a);
+    let reach = (pen.half_width() + PenModel::PAST_END) * (1.0 + slope * slope).sqrt() + 1.0;
+
+    let first_a = (from_a.min(to_a) - PenModel::PAST_END - pen.half_width()).floor().max(0.0) as usize;
+    let last_a = ((from_a.max(to_a) + PenModel::PAST_END + pen.half_width()).ceil().max(0.0) as usize).min(size_a.saturating_sub(1) as usize);
+    for a in first_a..=last_a {
+        // Where the stroke's line is at this column, kept within the stroke's own span
+        let along = (a as f32 + 0.5).clamp(from_a.min(to_a), from_a.max(to_a));
+        let line_b = from_b + (along - from_a) * slope;
+        let first_b = (line_b - reach).floor().max(0.0) as usize;
+        let last_b = ((line_b + reach).ceil().max(0.0) as usize).min(size_b.saturating_sub(1) as usize);
+        for b in first_b..=last_b {
+            let (x, y) = if steep { (b, a) } else { (a, b) };
+            if let Some((from_line, along)) = pen.inks(from, to, (x as f32 + 0.5, y as f32 + 0.5)) {
+                visit(x, y, from_line, along);
             }
         }
     }
@@ -568,7 +684,7 @@ mod tests {
     #[test]
     fn a_solid_block_is_filled_exactly() {
         let rows = ["..........", ".#######..", ".#######..", ".#######..", ".#######..", ".#######..", ".........."];
-        let strokes = plan_ink(&grid_from(&rows), FINELINER);
+        let strokes = plan_ink(&grid_from(&rows), Grid::new(rows[0].len(), rows.len()), FINELINER);
 
         assert_eq!(draw(&strokes, 10, 7, FINELINER), rows);
         // Two bars tile four rows; a third picks up the odd row
@@ -588,7 +704,7 @@ mod tests {
             ".##########.",
             "............",
         ];
-        let strokes = plan_ink(&grid_from(&rows), BALLPOINT);
+        let strokes = plan_ink(&grid_from(&rows), Grid::new(rows[0].len(), rows.len()), BALLPOINT);
 
         assert_eq!(draw(&strokes, 12, 9, BALLPOINT), rows);
         // Two bars tile six rows; a third picks up the odd row
@@ -602,7 +718,7 @@ mod tests {
         let rows = [
             "......", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", ".####.", "......",
         ];
-        let strokes = plan_ink(&grid_from(&rows), FINELINER);
+        let strokes = plan_ink(&grid_from(&rows), Grid::new(rows[0].len(), rows.len()), FINELINER);
 
         assert_eq!(draw(&strokes, 6, 14, FINELINER), rows);
         assert_eq!(strokes.len(), 2);
@@ -625,7 +741,7 @@ mod tests {
             ".##########.",
             "............",
         ];
-        let strokes = plan_ink(&grid_from(&rows), FINELINER);
+        let strokes = plan_ink(&grid_from(&rows), Grid::new(rows[0].len(), rows.len()), FINELINER);
 
         assert_eq!(draw(&strokes, 12, 12, FINELINER), rows);
         assert!(strokes.iter().any(|(from, to)| from.0 == to.0), "{strokes:?}");
@@ -640,7 +756,7 @@ mod tests {
             grid.set(4 + step, 5 + step, true);
             grid.set(5 + step, 5 + step, true);
         }
-        let strokes = plan_ink(&grid, FINELINER);
+        let strokes = plan_ink(&grid, Grid::new(40, 40), FINELINER);
 
         assert!(strokes.len() <= 3, "{strokes:?}");
         let (start, end) = (strokes[0].0, strokes[strokes.len() - 1].1);
@@ -650,7 +766,7 @@ mod tests {
 
     #[test]
     fn specks_are_left_out() {
-        let strokes = plan_ink(&grid_from(&["......", "..#...", "......", "......"]), FINELINER);
+        let strokes = plan_ink(&grid_from(&["......", "..#...", "......", "......"]), Grid::new(6, 4), FINELINER);
 
         assert!(strokes.is_empty());
     }

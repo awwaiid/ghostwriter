@@ -6,6 +6,7 @@ pub mod drawing_lab;
 pub mod embedded_assets;
 pub mod keyboard;
 pub mod llm_engine;
+mod path_strokes;
 pub mod pen;
 pub mod screenshot;
 pub mod segmenter;
