@@ -309,13 +309,21 @@ pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
         debug!("Marked what they ink after {:?}", started.elapsed());
         let on_page = |(x, y): Point| (x + left as f32, y + top as f32);
         strokes.extend(plan_ink(&ink, covered, pen).into_iter().map(|(from, to)| (on_page(from), on_page(to))));
+        debug!(
+            "{} strokes along lines and {} for the rest, after {:?}",
+            along_lines,
+            strokes.len() - along_lines,
+            started.elapsed()
+        );
+
+        let in_the_crop = |(x, y): Point| (x - left as f32, y - top as f32);
+        let order = drawing_order(
+            &strokes.iter().map(|&(from, to)| (in_the_crop(from), in_the_crop(to))).collect::<Vec<_>>(),
+            &ink,
+        );
+        strokes = order.into_iter().map(|index| strokes[index]).collect();
+        debug!("Put them in order after {:?}", started.elapsed());
     }
-    debug!(
-        "{} strokes along lines and {} for the rest, after {:?}",
-        along_lines,
-        strokes.len() - along_lines,
-        started.elapsed()
-    );
 
     let to_virtual = |(x, y): Point| (x * VIRTUAL_WIDTH as f32 / width as f32, y * VIRTUAL_HEIGHT as f32 / height as f32);
     Ok(strokes
@@ -325,6 +333,85 @@ pub fn plan_strokes(svg_data: &str, page_size: (u32, u32), pen: &PenModel) -> Re
             pressure: FULL_PRESSURE,
         })
         .collect())
+}
+
+/// The order to draw strokes in, as indexes into `strokes`: one shape at a time, the
+/// shapes in reading order, the way a person would go about it. Strokes planned for
+/// the whole page at once come out a row of the page at a time, like a printer.
+///
+/// A shape is a patch of ink that hangs together. Shapes are sorted into lines by how
+/// far down the page their middles are, as letters are, and each line is taken from
+/// left to right. Within a shape the strokes keep the order they were planned in.
+fn drawing_order(strokes: &[Segment], ink: &Grid) -> Vec<usize> {
+    // Which shape each cell of ink is part of, counting from 1
+    let shapes = ink.components();
+    let mut shape_at = vec![0u32; ink.cells.len()];
+    for (number, shape) in shapes.iter().enumerate() {
+        for &(x, y) in shape {
+            shape_at[y * ink.width + x] = number as u32 + 1;
+        }
+    }
+    let shape_near = |(x, y): Point| {
+        let (x, y) = (x.floor() as isize, y.floor() as isize);
+        // A stroke along the boundary between two rows is beside its ink, not on it
+        [(0, 0), (-1, 0), (0, -1), (-1, -1), (1, 0), (0, 1)]
+            .iter()
+            .filter(|&&(dx, dy)| ink.at(x + dx, y + dy))
+            .map(|&(dx, dy)| shape_at[(y + dy) as usize * ink.width + (x + dx) as usize])
+            .next()
+    };
+
+    // The shape each stroke belongs to: the one its middle is on, or failing that an
+    // end, or failing that whatever the stroke before it belonged to
+    let mut last = 0;
+    let stroke_shapes: Vec<u32> = strokes
+        .iter()
+        .map(|&(from, to)| {
+            let middle = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+            last = shape_near(middle).or_else(|| shape_near(from)).or_else(|| shape_near(to)).unwrap_or(last);
+            last
+        })
+        .collect();
+
+    // Where each shape is: its left edge, the middle of its height, and its height
+    let places: Vec<(usize, f32, usize)> = shapes
+        .iter()
+        .map(|shape| {
+            let left = shape.iter().map(|cell| cell.0).min().unwrap_or(0);
+            let (top, bottom) = shape.iter().fold((usize::MAX, 0), |(top, bottom), cell| (top.min(cell.1), bottom.max(cell.1)));
+            (left, (top + bottom) as f32 / 2.0, bottom - top + 1)
+        })
+        .collect();
+
+    // Shapes whose middles are within most of a typical shape's height of each other
+    // down the page are on the same line
+    let mut heights: Vec<usize> = places.iter().map(|place| place.2).collect();
+    heights.sort_unstable();
+    let line_height = heights.get(heights.len() / 2).copied().unwrap_or(1) as f32 * 0.7;
+    let mut down_the_page: Vec<usize> = (0..shapes.len()).collect();
+    down_the_page.sort_by(|&a, &b| places[a].1.total_cmp(&places[b].1));
+    let mut rank = vec![0usize; shapes.len() + 1];
+    let mut line: Vec<usize> = Vec::new();
+    let mut next_rank = 1;
+    let mut finish_line = |line: &mut Vec<usize>, rank: &mut Vec<usize>| {
+        line.sort_by_key(|&shape| places[shape].0);
+        for shape in line.drain(..) {
+            rank[shape + 1] = next_rank;
+            next_rank += 1;
+        }
+    };
+    for shape in down_the_page {
+        let line_middle = line.iter().map(|&other| places[other].1).sum::<f32>() / line.len().max(1) as f32;
+        if !line.is_empty() && places[shape].1 - line_middle > line_height {
+            finish_line(&mut line, &mut rank);
+        }
+        line.push(shape);
+    }
+    finish_line(&mut line, &mut rank);
+
+    let mut order: Vec<usize> = (0..strokes.len()).collect();
+    order.sort_by_key(|&index| rank[stroke_shapes[index] as usize]);
+    order
 }
 
 /// Count as covered the bare ink that is only a pixel thick along the edge of what is
@@ -868,6 +955,46 @@ mod tests {
         let (start, end) = (strokes[0].0, strokes[strokes.len() - 1].1);
         assert!((start.0 - 5.0).abs() < 2.5 && (start.1 - 5.5).abs() < 2.5, "{strokes:?}");
         assert!((end.0 - 34.0).abs() < 2.5 && (end.1 - 34.5).abs() < 2.5, "{strokes:?}");
+    }
+
+    #[test]
+    fn shapes_are_drawn_one_at_a_time_in_reading_order() {
+        // Three blocks on one line and one on the next, the second line starting further left
+        let mut ink = Grid::new(60, 40);
+        let blocks = [(30, 4), (4, 6), (46, 5), (2, 24)];
+        for &(left, top) in &blocks {
+            for y in top..top + 8 {
+                for x in left..left + 8 {
+                    ink.set(x, y, true);
+                }
+            }
+        }
+        // Planned a row of the page at a time, the blocks' strokes are mixed together
+        let strokes = plan_ink(&ink, Grid::new(60, 40), FINELINER);
+        let block_of = |&(from, _): &Segment| {
+            blocks
+                .iter()
+                .position(|&(left, _)| from.0 >= left as f32 && from.0 < left as f32 + 8.0)
+                .unwrap()
+        };
+        let planned: Vec<usize> = strokes.iter().map(block_of).collect();
+        assert_ne!(planned, {
+            let mut sorted = planned.clone();
+            sorted.sort_unstable();
+            sorted
+        });
+
+        let order = drawing_order(&strokes, &ink);
+        let drawn: Vec<usize> = order.iter().map(|&index| block_of(&strokes[index])).collect();
+
+        // The first line from left to right, then the second: four bars each
+        let expected: Vec<usize> = [1, 0, 2, 3].iter().flat_map(|&block| [block; 4]).collect();
+        assert_eq!(drawn, expected);
+        // And each block's own strokes in the order they were planned
+        for block in 0..4 {
+            let of_block = |indexes: &mut dyn Iterator<Item = usize>| indexes.filter(|&index| block_of(&strokes[index]) == block).collect::<Vec<_>>();
+            assert_eq!(of_block(&mut order.iter().copied()), of_block(&mut (0..strokes.len())));
+        }
     }
 
     #[test]
