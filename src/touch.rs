@@ -557,7 +557,9 @@ impl Touch {
     /// Tap, and wait for the screen to show what the tap was for. Taps again if nothing comes of it.
     async fn tap_until(&mut self, xy: (i32, i32), what: &str, done: impl Fn() -> bool) -> Result<()> {
         const HOLD: Duration = Duration::from_millis(40);
-        // Long enough that a slow answer is not taken for none: a second tap would undo the first
+        // Long enough that a slow answer is not taken for none: a second tap would undo the
+        // first. The palette answers within 20 ms as a rule, but after a long drawing
+        // xochitl can take over a second to get round to a tap it has accepted.
         const PATIENCE: Duration = Duration::from_millis(1500);
         // The tablet ignores touches until the pen has been gone this long
         const AFTER_PEN: Duration = Duration::from_millis(300);
