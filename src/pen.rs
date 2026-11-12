@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use crate::screenshot::{ScreenProbe, Screenshot};
-use crate::stroke_plan::{plan_strokes, watch_pixels};
+use crate::stroke_plan::{plan_strokes, watch_pixels, PenModel};
 use crate::util::{parse_svg, svg_to_alpha_bitmap};
 
 /// One continuous pen stroke.
@@ -52,22 +52,23 @@ pub const FULL_PRESSURE: i32 = 2630;
 /// How an SVG is to be drawn on a device. Working it out takes a few tenths of a
 /// second, which can be spent while something else is going on.
 pub enum Drawing {
-    /// Strokes planned for the Paper Pro's thin fineliner, the pen that has been
-    /// measured: a page that took half a minute takes a couple of seconds
-    Strokes(Vec<Stroke>),
+    /// Strokes planned for a pen that has been measured on the Paper Pro: a page that
+    /// took half a minute takes a couple of seconds
+    Strokes { strokes: Vec<Stroke>, pen: PenModel },
     /// Row by row, with pen pressure standing in for anti-aliasing. Each row of the
     /// page is `scale` rows of alpha values.
     Rows { alpha: Vec<Vec<u8>>, scale: u32 },
 }
 
 impl Drawing {
-    pub fn plan(svg_data: &str, device_model: DeviceModel) -> Result<Self> {
+    /// Work out how to draw an SVG with `pen`, the pen that is selected on the device.
+    pub fn plan(svg_data: &str, device_model: DeviceModel, pen: PenModel) -> Result<Self> {
         match device_model {
             DeviceModel::RemarkablePaperPro => {
                 let started = Instant::now();
-                let strokes = plan_strokes(svg_data, device_model.page_size())?;
+                let strokes = plan_strokes(svg_data, device_model.page_size(), &pen)?;
                 info!("Planned {} strokes in {:?}", strokes.len(), started.elapsed());
-                Ok(Self::Strokes(strokes))
+                Ok(Self::Strokes { strokes, pen })
             }
             _ => {
                 let scale = 2;
@@ -81,6 +82,9 @@ impl Drawing {
 pub struct Pen {
     device: Option<Device>,
     device_model: DeviceModel,
+    /// How far short of its last point each stroke gets an extra point, in device pixels,
+    /// for pens that only draw a stroke evenly when it has one (see `PenModel::tail`)
+    tail: f32,
 }
 
 impl Pen {
@@ -95,7 +99,11 @@ impl Pen {
             Some(Device::open(device_path).with_context(|| format!("Failed to open pen device {device_path}"))?)
         };
 
-        Ok(Self { device, device_model })
+        Ok(Self {
+            device,
+            device_model,
+            tail: 0.0,
+        })
     }
 
     pub fn draw_line_screen(&mut self, p1: (i32, i32), p2: (i32, i32)) -> Result<()> {
@@ -599,21 +607,26 @@ impl Pen {
         self.device_model
     }
 
-    /// Draw an SVG on the page.
-    pub fn draw_svg(&mut self, svg_data: &str) -> Result<()> {
-        self.draw(&Drawing::plan(svg_data, self.device_model)?)
+    /// Draw an SVG on the page with `pen`, the pen that is selected on the device.
+    pub fn draw_svg(&mut self, svg_data: &str, pen: PenModel) -> Result<()> {
+        self.draw(&Drawing::plan(svg_data, self.device_model, pen)?)
     }
 
     /// Draw what was planned for an SVG.
     pub fn draw(&mut self, drawing: &Drawing) -> Result<()> {
         match drawing {
-            Drawing::Strokes(strokes) => match Screenshot::new().and_then(|mut screenshot| screenshot.probe()) {
-                Ok(screen) => self.draw_strokes_watched(strokes, &screen),
-                Err(e) => {
-                    info!("Drawing without watching the screen: {}", e);
-                    self.draw_strokes(strokes, &StrokeTiming::default())
-                }
-            },
+            Drawing::Strokes { strokes, pen } => {
+                self.tail = pen.tail;
+                let drawn = match Screenshot::new().and_then(|mut screenshot| screenshot.probe()) {
+                    Ok(screen) => self.draw_strokes_watched(strokes, &screen, pen),
+                    Err(e) => {
+                        info!("Drawing without watching the screen: {}", e);
+                        self.draw_strokes(strokes, &StrokeTiming::default())
+                    }
+                };
+                self.tail = 0.0;
+                drawn
+            }
             Drawing::Rows { alpha, scale } => self.draw_bitmap_alpha_pressure(alpha, *scale),
         }
     }
@@ -626,12 +639,12 @@ impl Pen {
     /// the events of a 67th stroke arrive before it has caught up, the kernel throws away
     /// everything it was holding, and those strokes are never drawn. So strokes are only
     /// sent a little way ahead of the last one seen on the screen.
-    pub fn draw_strokes_watched(&mut self, strokes: &[Stroke], screen: &ScreenProbe) -> Result<()> {
+    pub fn draw_strokes_watched(&mut self, strokes: &[Stroke], screen: &ScreenProbe, pen: &PenModel) -> Result<()> {
         const ROUNDS: usize = 3;
 
         let started = Instant::now();
         // Ink that is already on the page says nothing about a new stroke
-        let watched: Vec<Option<(u32, u32)>> = watch_pixels(strokes, self.device_model.page_size())
+        let watched: Vec<Option<(u32, u32)>> = watch_pixels(strokes, self.device_model.page_size(), pen)
             .into_iter()
             .map(|pixel| pixel.filter(|&(x, y)| !screen.is_dark(x, y)))
             .collect();
@@ -735,6 +748,11 @@ impl Pen {
         sleep(timing.after_down);
 
         for (index, &point) in stroke.points.iter().enumerate().skip(1) {
+            if index == stroke.points.len() - 1 {
+                if let Some(short_of_end) = self.point_before_end(stroke) {
+                    self.goto_xy(self.virtual_point_to_input(short_of_end))?;
+                }
+            }
             self.goto_xy(self.virtual_point_to_input(point))?;
             if timing.points_per_pause > 0 && index % timing.points_per_pause == 0 {
                 sleep(timing.pause);
@@ -744,6 +762,19 @@ impl Pen {
         self.pen_up()?;
         sleep(timing.after_up);
         Ok(())
+    }
+
+    /// The point a little short of the end of a stroke, for a pen that needs one there.
+    fn point_before_end(&self, stroke: &Stroke) -> Option<(f32, f32)> {
+        if self.tail <= 0.0 || stroke.points.len() < 2 {
+            return None;
+        }
+        let (last, before) = (stroke.points[stroke.points.len() - 1], stroke.points[stroke.points.len() - 2]);
+        // Device pixels are not quite square in virtual coordinates, but near enough for so short a step
+        let tail = self.tail * VIRTUAL_WIDTH as f32 / self.device_model.page_size().0 as f32;
+        let (dx, dy) = (last.0 - before.0, last.1 - before.1);
+        let length = dx.hypot(dy);
+        (length > tail * 2.0).then(|| (last.0 - dx / length * tail, last.1 - dy / length * tail))
     }
 
     /// Convert a fractional virtual page coordinate to pen digitizer coordinates.
@@ -789,7 +820,11 @@ mod tests {
     use super::*;
 
     fn pen(device_model: DeviceModel) -> Pen {
-        Pen { device: None, device_model }
+        Pen {
+            device: None,
+            device_model,
+            tail: 0.0,
+        }
     }
 
     #[test]

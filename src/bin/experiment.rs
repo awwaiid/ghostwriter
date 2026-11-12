@@ -5,7 +5,7 @@ use ghostwriter::device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use ghostwriter::drawing_lab;
 use ghostwriter::pen::{Pen, StrokeTiming};
 use ghostwriter::screenshot::Screenshot;
-use ghostwriter::stroke_plan::{plan_strokes, simulate};
+use ghostwriter::stroke_plan::{plan_strokes, simulate, PenModel};
 use ghostwriter::touch::{PenTool, Touch, TriggerCorner};
 use ghostwriter::util::{svg_to_alpha_bitmap, svg_to_bitmap, svg_to_bitmap_threshold};
 use std::thread::sleep as std_sleep;
@@ -133,9 +133,20 @@ enum Commands {
         /// Plan one small mark per patch of ink instead of merging them into bars
         #[arg(long)]
         stipple: bool,
+        /// The pen to plan for: fineliner (thin) or ballpoint (medium)
+        #[arg(long, default_value = "fineliner")]
+        pen: String,
     },
     /// Draw an SVG file the way ghostwriter does: plan its strokes and draw them, watching the screen for any that do not arrive
-    DrawPlanned { svg_path: String },
+    DrawPlanned {
+        svg_path: String,
+        /// The pen to plan for: fineliner (thin) or ballpoint (medium)
+        #[arg(long, default_value = "fineliner")]
+        pen: String,
+        /// Draw with whatever pen is selected, instead of selecting the fineliner first
+        #[arg(long)]
+        no_select: bool,
+    },
     /// Draw the first strokes planned for an SVG file at a steady pace, and report how
     /// many of their watched pixels show on the screen as time passes
     WatchCheck {
@@ -158,6 +169,13 @@ enum Commands {
         /// Add a third point this far beyond the end of each bar, in tenths of a pixel
         #[arg(long, default_value_t = 0)]
         tail_tenths: u32,
+        /// Shift every bar along its own length by this instead of by --shift-tenths
+        #[arg(long)]
+        along_tenths: Option<u32>,
+        /// Put the third point at the end of the bar and the second one short of it,
+        /// instead of the second at the end and the third beyond
+        #[arg(long)]
+        tail_inside: bool,
     },
     /// Draw a bar at each of several pen pressures with whatever pen is selected, and
     /// print the grey levels across each bar and along its ends
@@ -600,7 +618,9 @@ async fn main() -> Result<()> {
             strokes_path,
             page,
             stipple,
+            pen,
         } => {
+            let pen = pen_model(&pen)?;
             let (width, height) = page.split_once('x').ok_or_else(|| anyhow::anyhow!("--page looks like 1632x2154"))?;
             let page_size = (width.parse()?, height.parse()?);
             let svg = std::fs::read_to_string(&svg_path)?;
@@ -609,13 +629,13 @@ async fn main() -> Result<()> {
             let strokes = if stipple {
                 drawing_lab::plan_stipple(&svg, page_size)?
             } else {
-                plan_strokes(&svg, page_size)?
+                plan_strokes(&svg, page_size, &pen)?
             };
             let planning = started.elapsed();
             std::fs::write(&strokes_path, drawing_lab::write_strokes(&strokes))?;
 
             // How the plan compares with the SVG, by the pen model
-            let drawn = simulate(&strokes, page_size);
+            let drawn = simulate(&strokes, page_size, &pen);
             let wanted = svg_to_alpha_bitmap(&svg, page_size.0, page_size.1)?;
             let (mut ink, mut missing, mut stray) = (0, 0, 0);
             for (drawn_row, wanted_row) in drawn.iter().zip(&wanted) {
@@ -638,9 +658,16 @@ async fn main() -> Result<()> {
             );
         }
 
-        Commands::DrawPlanned { svg_path } => {
+        Commands::DrawPlanned { svg_path, pen, no_select } => {
             let svg = std::fs::read_to_string(&svg_path)?;
-            with_fineliner(|| Pen::new(false)?.draw_svg(&svg)).await?;
+            let pen = pen_model(&pen)?;
+            if no_select {
+                let started = std::time::Instant::now();
+                Pen::new(false)?.draw_svg(&svg, pen)?;
+                println!("elapsed_ms={}", started.elapsed().as_millis());
+            } else {
+                with_fineliner(|| Pen::new(false)?.draw_svg(&svg, pen)).await?;
+            }
         }
 
         Commands::WatchCheck {
@@ -649,9 +676,9 @@ async fn main() -> Result<()> {
             select_tool,
         } => {
             let page_size = DeviceModel::detect().page_size();
-            let mut strokes = plan_strokes(&std::fs::read_to_string(&svg_path)?, page_size)?;
+            let mut strokes = plan_strokes(&std::fs::read_to_string(&svg_path)?, page_size, &PenModel::FINELINER_THIN)?;
             strokes.truncate(count);
-            let watched = ghostwriter::stroke_plan::watch_pixels(&strokes, page_size);
+            let watched = ghostwriter::stroke_plan::watch_pixels(&strokes, page_size, &PenModel::FINELINER_THIN);
             for (stroke, pixel) in strokes.iter().zip(&watched).take(5) {
                 let to_pixels = |(x, y): (f32, f32)| (x * page_size.0 as f32 / VIRTUAL_WIDTH as f32, y * page_size.1 as f32 / VIRTUAL_HEIGHT as f32);
                 println!(
@@ -693,27 +720,32 @@ async fn main() -> Result<()> {
             top,
             shift_tenths,
             tail_tenths,
+            along_tenths,
+            tail_inside,
         } => {
             let tail = tail_tenths as f32 / 10.0;
+            let along = along_tenths.unwrap_or(shift_tenths) as f32 / 10.0;
             let device_model = DeviceModel::detect();
             let (page_width, page_height) = device_model.page_size();
             let shift = shift_tenths as f32 / 10.0;
-            let to_virtual = |x: f32, y: f32| {
-                (
-                    (x + shift) * VIRTUAL_WIDTH as f32 / page_width as f32,
-                    (y + shift) * VIRTUAL_HEIGHT as f32 / page_height as f32,
-                )
-            };
+            let to_virtual = |x: f32, y: f32| (x * VIRTUAL_WIDTH as f32 / page_width as f32, y * VIRTUAL_HEIGHT as f32 / page_height as f32);
             // Across: bar `length` starts at x = 200 on its own line. Down: at y = top + 300.
             let across = |length: u32| ((200, top + length * 12), (200 + length, top + length * 12));
             let down = |length: u32| ((400 + length * 12, top), (400 + length * 12, top + length));
             let mut strokes = Vec::new();
             for length in 1..=12 {
                 for ((x1, y1), (x2, y2)) in [across(length), down(length)] {
-                    let mut points = vec![to_virtual(x1 as f32, y1 as f32), to_virtual(x2 as f32, y2 as f32)];
+                    // Shifted by `along` in the direction the bar runs, and by `shift` across it
+                    let (shift_x, shift_y) = if y1 == y2 { (along, shift) } else { (shift, along) };
+                    let (x1, y1, x2, y2) = (x1 as f32 + shift_x, y1 as f32 + shift_y, x2 as f32 + shift_x, y2 as f32 + shift_y);
+                    let mut points = vec![to_virtual(x1, y1), to_virtual(x2, y2)];
                     if tail > 0.0 {
                         let (dx, dy) = if y1 == y2 { (tail, 0.0) } else { (0.0, tail) };
-                        points.push(to_virtual(x2 as f32 + dx, y2 as f32 + dy));
+                        if tail_inside {
+                            points.insert(1, to_virtual(x2 - dx, y2 - dy));
+                        } else {
+                            points.push(to_virtual(x2 + dx, y2 + dy));
+                        }
                     }
                     strokes.push(ghostwriter::pen::Stroke {
                         points,
@@ -1081,6 +1113,15 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The measured pen that goes by a name on the command line.
+fn pen_model(name: &str) -> Result<PenModel> {
+    match name {
+        "fineliner" => Ok(PenModel::FINELINER_THIN),
+        "ballpoint" => Ok(PenModel::BALLPOINT_MEDIUM),
+        other => anyhow::bail!("Unknown pen {other}: use fineliner or ballpoint"),
+    }
 }
 
 fn gcd(a: usize, b: usize) -> usize {

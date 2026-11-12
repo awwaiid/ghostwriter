@@ -20,6 +20,7 @@ use ghostwriter::{
     pen::{Drawing, Pen},
     simulation::SimulationConfig,
     status::GhostwriterStatus,
+    stroke_plan::PenModel,
     touch::{PenTool, Touch, TriggerCorner},
     util::{setup_uinput, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
@@ -261,7 +262,7 @@ fn draw_svg(svg_data: &str, drawing: Option<Drawing>, keyboard: &mut Keyboard, p
     if !no_draw {
         match drawing {
             Some(drawing) => pen.draw(&drawing)?,
-            None => pen.draw_svg(svg_data)?,
+            None => pen.draw_svg(svg_data, PenModel::FINELINER_THIN)?,
         }
     }
     Ok(())
@@ -659,7 +660,7 @@ fn register_tools(
                 let (previous_tool, drawing) = if !no_draw && !test_mode {
                     let device_model = lock!(pen_clone).device_model();
                     std::thread::scope(|scope| {
-                        let planning = scope.spawn(|| Drawing::plan(svg_data, device_model));
+                        let planning = scope.spawn(|| Drawing::plan(svg_data, device_model, PenModel::FINELINER_THIN));
                         let previous_tool = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight)?.select_fineliner().await })
                         })
