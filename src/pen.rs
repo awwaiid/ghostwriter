@@ -529,6 +529,13 @@ impl Pen {
     /// Convert a position on the page, as fractions of its width and height, to pen digitizer coordinates.
     fn page_to_input(&self, x_fraction: f32, y_fraction: f32) -> (f32, f32) {
         let (pen_width, pen_height) = self.device_model.pen_size();
+
+        // The digitizer's range does not always cover exactly the page
+        let (page_width, page_height) = self.device_model.page_size();
+        let (area_width, area_height) = self.device_model.pen_area_size();
+        let x_fraction = x_fraction * page_width as f32 / area_width as f32;
+        let y_fraction = y_fraction * page_height as f32 / area_height as f32;
+
         match self.device_model.input_orientation() {
             InputOrientation::Portrait => (x_fraction * pen_width as f32, y_fraction * pen_height as f32),
             // The digitizer is rotated: its x axis runs up the page and its y axis across it.
@@ -562,9 +569,10 @@ mod tests {
     #[test]
     fn paper_pro_maps_the_page_straight_onto_the_digitizer() {
         let pen = pen(DeviceModel::RemarkablePaperPro);
+        // The page is 1632x2154 pixels, of which the pen covers 1620x2160 from the top-left
         assert_eq!(pen.virtual_to_input((0, 0)), (0, 0));
-        assert_eq!(pen.virtual_to_input((384, 512)), (5590, 7670));
-        assert_eq!(pen.virtual_to_input((768, 1024)), (11180, 15340));
+        assert_eq!(pen.virtual_to_input((384, 512)), (5631, 7648));
+        assert_eq!(pen.virtual_to_input((768, 1024)), (11262, 15297));
     }
 
     #[test]

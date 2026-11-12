@@ -110,6 +110,28 @@ impl DeviceModel {
         }
     }
 
+    /// The (width, height) of the page in framebuffer pixels, the right way up.
+    pub fn page_size(&self) -> (u32, u32) {
+        match self {
+            DeviceModel::Remarkable2 | DeviceModel::Unknown => (1404, 1872),
+            _ => self.framebuffer_size(),
+        }
+    }
+
+    /// The (width, height), in framebuffer pixels, of the area the pen digitizer's range covers,
+    /// starting from the page's top-left corner.
+    ///
+    /// Usually that is the whole page. The Paper Pro's framebuffer has been 1632x2154 since
+    /// firmware 3.20, but its pen still spans the panel's own 1620x2160. Measured on
+    /// firmware 3.29 by drawing crosses and finding them in a capture: without this,
+    /// strokes land up to 10 pixels left and 6 pixels low of where they were aimed.
+    pub fn pen_area_size(&self) -> (u32, u32) {
+        match self {
+            DeviceModel::RemarkablePaperPro => (1620, 2160),
+            _ => self.page_size(),
+        }
+    }
+
     /// Framebuffer (width, height) in pixels, as stored in xochitl's memory.
     /// The reMarkable 2 stores it in landscape before firmware 3.24.
     pub fn framebuffer_size(&self) -> (u32, u32) {
