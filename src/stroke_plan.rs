@@ -68,6 +68,18 @@ impl PenModel {
         self.rows as f32 / 2.0
     }
 
+    /// How far along a stroke `length` pixels long its ink is thin before it reaches its
+    /// full width. Only a pen that needs a tail starts thin, and only on strokes longer
+    /// than 6 pixels: for about the first quarter of them, up to 45 pixels or so, the
+    /// side of the line to the left of the pen's travel is grey rather than black.
+    fn thin_start(&self, length: f32) -> usize {
+        if self.tail == 0.0 || length <= 6.0 {
+            0
+        } else {
+            ((length * 0.25).ceil() as usize + 2).min(48)
+        }
+    }
+
     /// Whether a stroke from `from` to `to` inks the pixel centred on `centre`. If it
     /// does: how far the centre is from the stroke's line, and how far along the stroke
     /// it is, from 0 at the start to 1 at the end (beyond those, past the ends).
@@ -339,7 +351,7 @@ fn drop_slivers(ink: &Grid, covered: &mut Grid) {
 fn plan_ink(ink: &Grid, mut covered: Grid, pen: &PenModel) -> Vec<Segment> {
     let mut strokes = Vec::new();
 
-    // Bars run along whichever direction gives the longer bar at each pixel...
+    // Bars run along whichever direction gives the longer bar at each pixel,
     let across = ink.run_lengths();
     let sideways = ink.transposed();
     let down = sideways.run_lengths();
@@ -349,15 +361,39 @@ fn plan_ink(ink: &Grid, mut covered: Grid, pen: &PenModel) -> Vec<Segment> {
             prefers_across.set(x, y, ink.get(x, y) && across[y * ink.width + x] >= down[x * ink.height + y]);
         }
     }
-    strokes.extend(bars(ink, &prefers_across, &mut covered, pen));
-
-    // ...and then the other direction, and the first again, mop up
-    let mut covered_sideways = covered.transposed();
-    let upright = bars(&sideways, &sideways, &mut covered_sideways, pen);
-    strokes.extend(upright.into_iter().map(|((x1, y1), (x2, y2))| ((y1, x1), (y2, x2))));
-    covered = covered_sideways.transposed();
-
-    strokes.extend(bars(ink, ink, &mut covered, pen));
+    // ...and then the other direction, and the first again, mop up.
+    //
+    // With some pens a bar's ink is faint along one side near its start. Going across
+    // the page that side is the bar's top row; going down it is the right-hand column,
+    // which is the last row with rows and columns swapped. What a pass leaves faint is
+    // left for the next pass to ink, crossing it the other way, and the passes carry on
+    // until nothing is left faint: each has less to do than the one before.
+    const MOST_PASSES: usize = 8;
+    let (first_row, last_row) = (0, pen.rows - 1);
+    let mut faint = Vec::new();
+    for pass in 0..MOST_PASSES {
+        if pass >= 3 && faint.is_empty() {
+            break;
+        }
+        if pass % 2 == 0 {
+            let wanted = if pass == 0 { &prefers_across } else { ink };
+            for (x, y) in faint.drain(..) {
+                covered.set(x, y, false);
+            }
+            let (level, left_faint) = bars(ink, wanted, &mut covered, pen, first_row);
+            strokes.extend(level);
+            faint = left_faint;
+        } else {
+            let mut covered_sideways = covered.transposed();
+            for (x, y) in faint.drain(..) {
+                covered_sideways.set(y, x, false);
+            }
+            let (upright, left_faint) = bars(&sideways, &sideways, &mut covered_sideways, pen, last_row);
+            strokes.extend(upright.into_iter().map(|((x1, y1), (x2, y2))| ((y1, x1), (y2, x2))));
+            covered = covered_sideways.transposed();
+            faint = left_faint.into_iter().map(|(x, y)| (y, x)).collect();
+        }
+    }
 
     // What is still bare is too thin for a bar either way: lines no wider than the pen,
     // which are drawn along their middle. Slivers along the edge of something already
@@ -389,11 +425,16 @@ fn plan_ink(ink: &Grid, mut covered: Grid, pen: &PenModel) -> Vec<Segment> {
 /// is wide. It is only put where all those rows are inside `ink`, so it never marks
 /// outside the shape, and it stops a pixel short of each end of the run because the
 /// pen's ink carries on that far.
-fn bars(ink: &Grid, wanted: &Grid, covered: &mut Grid, pen: &PenModel) -> Vec<Segment> {
+///
+/// Also returns the cells that a bar inks only faintly, where the pen starts its
+/// strokes thin: the first few cells of the bar's `faint_row` (counting from its top
+/// row). They are marked as covered like the rest.
+fn bars(ink: &Grid, wanted: &Grid, covered: &mut Grid, pen: &PenModel, faint_row: usize) -> (Vec<Segment>, Vec<(usize, usize)>) {
     let mut strokes = Vec::new();
+    let mut faint = Vec::new();
     let rows = pen.rows;
     if ink.height < rows {
-        return strokes;
+        return (strokes, faint);
     }
 
     // Going down the page, a bar whose top row is `top` is the last chance to ink that
@@ -434,17 +475,20 @@ fn bars(ink: &Grid, wanted: &Grid, covered: &mut Grid, pen: &PenModel) -> Vec<Se
             };
             for (start, end) in spans_needing_ink(run_start, run_end, needs_ink) {
                 let middle = top as f32 + pen.half_width();
-                strokes.push(((start as f32 + PenModel::PAST_END, middle), (end as f32 - PenModel::PAST_END, middle)));
+                let (from, to) = (start as f32 + PenModel::PAST_END, end as f32 - PenModel::PAST_END);
+                strokes.push(((from, middle), (to, middle)));
                 for y in top..top + rows {
                     for x in start..end {
                         covered.set(x, y, true);
                     }
                 }
+                let thin = pen.thin_start(to - from);
+                faint.extend((start + 1..(start + 1 + thin).min(end)).map(|x| (x, top + faint_row)));
             }
         }
     }
 
-    strokes
+    (strokes, faint)
 }
 
 /// The stretches of a run that still need ink, each widened to at least the shortest
@@ -726,21 +770,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pen_that_starts_thin_has_its_bars_crossed_near_their_starts() {
+        // Forty across and nine down: three bars across it, each thirty-eight long
+        let mut ink = Grid::new(44, 13);
+        for y in 2..11 {
+            for x in 2..42 {
+                ink.set(x, y, true);
+            }
+        }
+        let strokes = plan_ink(&ink, Grid::new(44, 13), BALLPOINT);
+
+        let level: Vec<&Segment> = strokes.iter().filter(|(from, to)| from.1 == to.1).collect();
+        let upright: Vec<&Segment> = strokes.iter().filter(|(from, to)| from.0 == to.0).collect();
+        assert_eq!(level.iter().filter(|(from, to)| to.0 - from.0 == 38.0).count(), 3, "{strokes:?}");
+        // Each long bar is faint along its top row for its first ten pixels or so, so
+        // bars run down the block there: three pixels wide, side by side
+        assert!(upright.len() >= 3, "{strokes:?}");
+        for x in 3..12 {
+            assert!(
+                upright.iter().any(|(from, _)| (from.0 - (x as f32 + 0.5)).abs() <= 1.5),
+                "nothing crosses column {x}: {strokes:?}"
+            );
+        }
+        // A fineliner draws evenly from the start, and needs none of that
+        let fineliner = plan_ink(&ink, Grid::new(44, 13), FINELINER);
+        assert!(fineliner.iter().all(|(from, to)| from.1 == to.1), "{fineliner:?}");
+    }
+
+    #[test]
     fn a_wider_pen_fills_a_block_with_fewer_bars() {
         let rows = [
-            "............",
-            ".##########.",
-            ".##########.",
-            ".##########.",
-            ".##########.",
-            ".##########.",
-            ".##########.",
-            ".##########.",
-            "............",
+            "..........",
+            ".########.",
+            ".########.",
+            ".########.",
+            ".########.",
+            ".########.",
+            ".########.",
+            ".########.",
+            "..........",
         ];
         let strokes = plan_ink(&grid_from(&rows), Grid::new(rows[0].len(), rows.len()), BALLPOINT);
 
-        assert_eq!(draw(&strokes, 12, 9, BALLPOINT), rows);
+        assert_eq!(draw(&strokes, 10, 9, BALLPOINT), rows);
         // Two bars tile six rows; a third picks up the odd row
         assert_eq!(strokes.len(), 3);
         // Each runs along the middle of a row of pixels
