@@ -18,6 +18,7 @@ use ghostwriter::{
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
     pen::{Drawing, DrawingPen, Pen},
+    screenshot::Screenshot,
     simulation::SimulationConfig,
     status::GhostwriterStatus,
     stroke_plan::Ink,
@@ -584,6 +585,11 @@ async fn run_ghostwriter_loop(
         let cancellation = Arc::clone(&cancellation);
         tokio::spawn(async move { coordinator::progress_task(keyboard, progress_rx, cancellation).await })
     };
+
+    // While waiting for the first trigger, find the screen, so that the first screenshot is as quick as the rest
+    if !config.is_test_mode() && config.input_png.is_none() {
+        tokio::task::spawn_blocking(Screenshot::find_screen_ahead);
+    }
 
     // Main loop
     let mut trigger_rx = channels.trigger_rx;
