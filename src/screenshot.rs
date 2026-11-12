@@ -147,8 +147,11 @@ impl Screenshot {
             return Ok(());
         }
 
+        let started = std::time::Instant::now();
         let image = self.capture_full_resolution()?;
+        debug!("Captured the screen in {:?}", started.elapsed());
         let (png, scaled) = Self::scale_and_encode(&image)?;
+        debug!("Scaled and encoded it after {:?}", started.elapsed());
 
         if let ScreenshotMode::Real { data, pixels, .. } = &mut self.mode {
             *data = png;
@@ -164,10 +167,20 @@ impl Screenshot {
         let (pid, address) = self.locate_screen_buffer()?;
 
         debug!("screenshot: reading data");
+        let started = std::time::Instant::now();
         let framebuffer = self.read_framebuffer(&pid, address)?;
 
-        debug!("screenshot: processing image");
+        debug!("screenshot: processing image, after {:?} of reading", started.elapsed());
         self.decode_framebuffer(framebuffer)
+    }
+
+    /// Find where the screen is in xochitl's memory now, so that the first screenshot
+    /// does not have to: it takes a quarter of a second, and is remembered.
+    pub fn find_screen_ahead() {
+        let found = Screenshot::new().and_then(|screenshot| screenshot.locate_screen_buffer());
+        if let Err(e) = found {
+            debug!("Could not find the screen ahead of time: {}", e);
+        }
     }
 
     /// A probe for reading single pixels of the live screen.
@@ -454,9 +467,10 @@ impl Screenshot {
         debug!("Resizing image to {}x{}", VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
         // Averaging, not picking every other pixel: a pen line is only two pixels wide,
         // and picking can miss it altogether
+        let started = std::time::Instant::now();
         let scaled = image.thumbnail_exact(VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
 
-        debug!("Encoding resized image");
+        debug!("Encoding resized image, after {:?} of resizing", started.elapsed());
         let mut png_data = Vec::new();
         image::codecs::png::PngEncoder::new(&mut png_data).write_image(scaled.as_bytes(), VIRTUAL_WIDTH, VIRTUAL_HEIGHT, scaled.color().into())?;
 
