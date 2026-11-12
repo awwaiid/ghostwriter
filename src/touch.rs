@@ -59,6 +59,8 @@ impl PenSetup {
 /// What `Touch::select_pen` changed, for `Touch::restore_pen` to put back.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PenRestore {
+    /// Whether the palette was open
+    pub palette_open: bool,
     /// The tool that was selected
     pub tool: PenTool,
     /// What the pen's kind, stroke size and colour were, each only if it was changed.
@@ -72,6 +74,7 @@ pub struct PenRestore {
 impl PenRestore {
     /// Nothing was changed, so there is nothing to put back.
     pub const NOTHING: Self = Self {
+        palette_open: false,
         tool: PenTool::Unknown,
         kind: None,
         size: None,
@@ -661,6 +664,7 @@ impl Touch {
     /// Select a pen and set it up, reading the palette off the screen after each tap
     /// instead of allowing time for it.
     async fn select_pen_watching(&mut self, palette: &Palette, wanted: PenSetup) -> Result<PenRestore> {
+        let palette_open = palette.selected_tool().is_some();
         self.open_palette(palette).await?;
         let tool = match palette.selected_tool() {
             Some(0) => PenTool::Ballpoint,
@@ -670,6 +674,7 @@ impl Touch {
         };
         self.open_pen_settings(palette, wanted.slot).await?;
         let restore = PenRestore {
+            palette_open,
             tool,
             kind: self.choose_kind(palette, wanted.slot, wanted.kind).await?,
             size: self.choose_size(palette, wanted.slot, wanted.size).await?,
@@ -690,7 +695,7 @@ impl Touch {
             PenTool::Unknown => None,
         };
         let pen_changed = restore.kind.is_some() || restore.size.is_some() || restore.colour.is_some();
-        if !pen_changed && tool.is_none_or(|tool| tool == pen.slot) {
+        if !pen_changed && tool.is_none_or(|tool| tool == pen.slot) && !restore.palette_open {
             return Ok(());
         }
 
@@ -711,6 +716,16 @@ impl Touch {
         if let Some(tool) = tool.filter(|&tool| palette.selected_tool() != Some(tool)) {
             let middle = Palette::middle(Palette::tool_box(tool), &self.device_model());
             self.tap_until(middle, "select the tool", || palette.selected_tool() == Some(tool)).await?;
+        }
+        // Drawing needs the palette out of the way; afterwards it is left open if it was
+        // open, though without the pen's settings showing
+        if restore.palette_open {
+            if palette.settings_showing(pen.slot) {
+                let pen_box = Palette::middle(Palette::tool_box(pen.slot), &self.device_model());
+                self.tap_until(pen_box, "close the pen's settings", || !palette.settings_showing(pen.slot))
+                    .await?;
+            }
+            return Ok(());
         }
         self.close_palette(palette).await
     }
