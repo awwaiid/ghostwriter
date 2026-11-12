@@ -275,6 +275,9 @@ enum Commands {
         /// Draw the bars in a scattered order instead of along each row in turn
         #[arg(long)]
         scatter: bool,
+        /// Where the grid starts across the page, in device pixels
+        #[arg(long, default_value_t = 100)]
+        left: u32,
     },
     /// Draw short bars while a second reader of the pen device does not read, then report
     /// what that reader was sent: events per stroke, and whether the kernel dropped any
@@ -1066,6 +1069,7 @@ async fn main() -> Result<()> {
             blind_wait_us,
             top,
             scatter,
+            left,
         } => {
             let device_model = DeviceModel::detect();
             let probe = Screenshot::new()?.probe()?;
@@ -1082,7 +1086,7 @@ async fn main() -> Result<()> {
                 } else {
                     index
                 };
-                let x = 100 + (index % COLUMNS) as u32 * 16;
+                let x = left + (index % COLUMNS) as u32 * 16;
                 let y = top + (index / COLUMNS) as u32 * 6;
                 ((x, y), (x + 10, y))
             };
