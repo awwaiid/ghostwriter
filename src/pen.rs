@@ -64,19 +64,32 @@ impl Default for StrokeTiming {
 /// The pressure of a firm stroke. (The digitizers report up to about 4096.)
 pub const FULL_PRESSURE: i32 = 2630;
 
-/// When any `Pen` in this process last lifted off the page.
-static LAST_LIFTED: Mutex<Option<Instant>> = Mutex::new(None);
+/// When any `Pen` in this process last lifted off the page, and how many strokes it
+/// had drawn since a touch was last taken.
+static LAST_LIFTED: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
 
-/// How long ago the pen last lifted off the page, if it has drawn at all.
+/// How much longer the tablet will go on ignoring touches because of the pen.
 ///
-/// The tablet ignores touches while a pen is about, and goes on ignoring them for a
-/// little under a quarter of a second after it has gone (measured on a Paper Pro,
-/// firmware 3.29: a tap 220 ms after the pen is lost, one at 240 ms is taken).
-pub fn time_since_pen_lifted() -> Option<Duration> {
-    LAST_LIFTED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .map(|lifted| lifted.elapsed())
+/// It ignores them while a pen is about, and for a little under a quarter of a second
+/// after it has gone (measured on a Paper Pro, firmware 3.29: a tap 220 ms after the
+/// pen is lost, one at 240 ms is taken). After a long drawing it takes longer to come
+/// round: with thousands of strokes behind it, a second or two.
+pub fn touch_ignored_for() -> Duration {
+    const AFTER_PEN: Duration = Duration::from_millis(300);
+    const FOR_EACH_STROKE: Duration = Duration::from_micros(400);
+    const AT_MOST: Duration = Duration::from_millis(2500);
+
+    match *LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        Some((lifted, strokes)) => (AFTER_PEN + FOR_EACH_STROKE * strokes as u32).min(AT_MOST).saturating_sub(lifted.elapsed()),
+        None => Duration::ZERO,
+    }
+}
+
+/// A touch has been taken, so the strokes drawn before it are done with.
+pub fn touch_was_taken() {
+    if let Some((_, strokes)) = LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
+        *strokes = 0;
+    }
 }
 
 /// The pens ghostwriter can draw with: the ones whose strokes have been measured.
@@ -284,7 +297,9 @@ impl Pen {
                 InputEvent::new(EvdevEventType::KEY.0, 320, 0),           // BTN_TOOL_PEN
                 InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
             ])?;
-            *LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+            let mut last_lifted = LAST_LIFTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let strokes = last_lifted.map_or(0, |(_, strokes)| strokes);
+            *last_lifted = Some((Instant::now(), strokes + 1));
         }
         Ok(())
     }

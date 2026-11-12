@@ -8,7 +8,7 @@ use tokio::time::sleep;
 
 use crate::cancellation::GhostwriterCancellation;
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
-use crate::pen::time_since_pen_lifted;
+use crate::pen::{touch_ignored_for, touch_was_taken};
 use crate::screenshot::{ScreenProbe, Screenshot};
 use crate::simulation::{SimulationConfig, TouchSimulator};
 
@@ -564,12 +564,9 @@ impl Touch {
         // first. The palette answers within 20 ms as a rule, but after a long drawing
         // xochitl can take over a second to get round to a tap it has accepted.
         const PATIENCE: Duration = Duration::from_millis(1500);
-        // The tablet ignores touches until the pen has been gone this long
-        const AFTER_PEN: Duration = Duration::from_millis(300);
 
-        if let Some(wait) = time_since_pen_lifted().and_then(|since| AFTER_PEN.checked_sub(since)) {
-            sleep(wait).await;
-        }
+        // The tablet ignores touches for a while after the pen has been drawing
+        sleep(touch_ignored_for()).await;
         for _ in 0..2 {
             self.touch_start(xy).await?;
             sleep(HOLD).await;
@@ -579,6 +576,7 @@ impl Touch {
             while tapped_at.elapsed() < PATIENCE {
                 if done() {
                     debug!("{} took {:?}", what, tapped_at.elapsed());
+                    touch_was_taken();
                     return Ok(());
                 }
                 sleep(Duration::from_millis(5)).await;
