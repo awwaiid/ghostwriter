@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 
 /// Every device is normalized to this virtual page size: screenshots are scaled to it
 /// before they go to the model, and the coordinates the model draws with are scaled
@@ -141,6 +142,67 @@ impl DeviceModel {
             DeviceModel::RemarkablePaperPure => (1404, 1872),
             // The panel is 954 pixels wide; rows are padded to 960.
             DeviceModel::RemarkablePaperProMove => (960, 1696),
+        }
+    }
+}
+
+/// Keeps the tablet's memory running at full speed for as long as it is held.
+///
+/// The Paper Pro slows its memory bus down when little is going on, and whether the
+/// screen is busy decides that, not how hard a program is working. Caught in the slow
+/// mode, ghostwriter's own work takes about four times as long: 1.4 seconds for a
+/// screenshot instead of 0.4, a second to plan a drawing instead of a quarter of one.
+/// (Measured on firmware 3.29. The tablet spends about half its time in each mode.)
+///
+/// The kernel's bus frequency driver has a switch for this, which is turned off while
+/// any `FullSpeed` is held and back on when the last is dropped. On a device without
+/// the driver, holding one does nothing.
+pub struct FullSpeed {
+    switched: bool,
+}
+
+/// How many `FullSpeed`s are held that switched the slowing-down off.
+static FULL_SPEED_HOLDERS: Mutex<usize> = Mutex::new(0);
+
+impl FullSpeed {
+    pub fn hold() -> Self {
+        let mut holders = FULL_SPEED_HOLDERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let switched = *holders > 0 || Self::set_bus_scaling(false);
+        if switched {
+            *holders += 1;
+        }
+        Self { switched }
+    }
+
+    /// Let the tablet slow its memory down again, in case an earlier run of
+    /// ghostwriter was stopped while it held it at full speed.
+    pub fn release_any_left_held() {
+        Self::set_bus_scaling(true);
+    }
+
+    /// Turn the kernel's slowing-down of the memory bus on or off. Returns whether there was a switch to turn.
+    fn set_bus_scaling(enabled: bool) -> bool {
+        let Ok(devices) = std::fs::read_dir("/sys/bus/platform/drivers/imx_busfreq") else {
+            return false;
+        };
+        let value = if enabled { "1" } else { "0" };
+        devices
+            .flatten()
+            .map(|device| device.path().join("enable"))
+            .filter(|switch| switch.exists())
+            .fold(false, |any, switch| std::fs::write(switch, value).is_ok() || any)
+    }
+}
+
+impl Drop for FullSpeed {
+    fn drop(&mut self) {
+        if !self.switched {
+            return;
+        }
+        let mut holders = FULL_SPEED_HOLDERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *holders = holders.saturating_sub(1);
+        if *holders == 0 {
+            Self::set_bus_scaling(true);
         }
     }
 }

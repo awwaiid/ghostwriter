@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use evdev::{Device, EventType as EvdevEventType, InputEvent};
-use ghostwriter::device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
+use ghostwriter::device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
 use ghostwriter::drawing_lab;
 use ghostwriter::pen::{Pen, StrokeTiming};
 use ghostwriter::screenshot::Screenshot;
@@ -136,6 +136,14 @@ enum Commands {
         /// The pen to plan for: fineliner (thin) or ballpoint (medium)
         #[arg(long, default_value = "fineliner")]
         pen: String,
+        /// Plan it this many more times first, pausing before each, and report how long each took
+        #[arg(long, default_value_t = 0)]
+        repeat: usize,
+        /// How long to pause before each repeat, and what to do meanwhile: wait or spin
+        #[arg(long, default_value_t = 3000)]
+        pause_ms: u64,
+        #[arg(long)]
+        spin: bool,
     },
     /// Draw an SVG file the way ghostwriter does: plan its strokes and draw them, watching the screen for any that do not arrive
     DrawPlanned {
@@ -619,11 +627,31 @@ async fn main() -> Result<()> {
             page,
             stipple,
             pen,
+            repeat,
+            pause_ms,
+            spin,
         } => {
             let pen = pen_model(&pen)?;
             let (width, height) = page.split_once('x').ok_or_else(|| anyhow::anyhow!("--page looks like 1632x2154"))?;
             let page_size = (width.parse()?, height.parse()?);
             let svg = std::fs::read_to_string(&svg_path)?;
+
+            for _ in 0..repeat {
+                let pause = Duration::from_millis(pause_ms);
+                if spin {
+                    // Wait, but keep a processor busy for the last tenth of a second
+                    std_sleep(pause.saturating_sub(Duration::from_millis(100)));
+                    let spinning = std::time::Instant::now();
+                    while spinning.elapsed() < Duration::from_millis(100).min(pause) {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    std_sleep(pause);
+                }
+                let started = std::time::Instant::now();
+                let strokes = plan_strokes(&svg, page_size, &pen)?;
+                println!("planned {} strokes in {} ms", strokes.len(), started.elapsed().as_millis());
+            }
 
             let started = std::time::Instant::now();
             let strokes = if stipple {
@@ -659,6 +687,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::DrawPlanned { svg_path, pen, no_select } => {
+            let _full_speed = FullSpeed::hold();
             let svg = std::fs::read_to_string(&svg_path)?;
             let pen = pen_model(&pen)?;
             if no_select {

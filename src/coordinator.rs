@@ -7,6 +7,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::cancellation::GhostwriterCancellation;
 use crate::config::Config;
+use crate::device::FullSpeed;
 use crate::embedded_assets::load_config;
 use crate::keyboard::Keyboard;
 use crate::llm_engine::{LLMEngine, ModelExecutionStatus};
@@ -275,6 +276,9 @@ pub async fn processing_task(
     touch: Arc<tokio::sync::RwLock<Touch>>,
 ) -> Result<()> {
     info!("Processing task: starting");
+
+    // From the screenshot to the last stroke, the tablet should not be slowing itself down
+    let _full_speed = FullSpeed::hold();
 
     // Update progress: taking screenshot
     info!("Setting ProgressState::TakingScreenshot");

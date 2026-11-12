@@ -13,7 +13,7 @@ use ghostwriter::{
     cancellation::GhostwriterCancellation,
     config::Config,
     coordinator::{self, CoordinatorChannels, ProgressState},
-    device::{DeviceModel, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
+    device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
     embedded_assets::load_config,
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
@@ -226,6 +226,7 @@ async fn main() -> Result<()> {
     }
 
     setup_uinput()?;
+    FullSpeed::release_any_left_held();
 
     ghostwriter(&args, config).await
 }
