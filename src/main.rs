@@ -277,6 +277,47 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     Ok(())
 }
 
+/// Text typed a piece at a time, while the model is still writing it.
+struct LiveTyping {
+    keyboard: Arc<Mutex<Keyboard>>,
+    /// How many characters of the text have been typed
+    typed: usize,
+}
+
+impl LiveTyping {
+    /// More of the draw_text tool's arguments have arrived: type what is new of its text.
+    fn arguments_so_far(&mut self, arguments: &str) {
+        if let Some(text) = string_property_so_far(arguments, "text") {
+            if let Err(e) = self.type_up_to(&text) {
+                log::error!("Failed to type text: {}", e);
+            }
+        }
+    }
+
+    /// Type whatever of `text` has not been typed yet.
+    fn type_up_to(&mut self, text: &str) -> Result<()> {
+        let new: String = text.chars().skip(self.typed).collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        let mut keyboard = lock!(self.keyboard);
+        if self.typed == 0 {
+            info!("Typing text as it arrives.");
+            keyboard.progress_end()?;
+            keyboard.key_cmd_body()?;
+        }
+        self.typed += new.chars().count();
+        keyboard.string_to_keypresses(&new)
+    }
+
+    /// All of the text has arrived: type the last of it, and be ready for the next.
+    fn finish(&mut self, text: &str) -> Result<()> {
+        let typed = self.type_up_to(text);
+        self.typed = 0;
+        typed
+    }
+}
+
 /// How the draw_svg tool goes about drawing.
 #[derive(Clone)]
 struct SvgDrawing {
@@ -846,6 +887,15 @@ fn register_tools(
     let no_draw = config.no_draw;
     let keyboard_clone = Arc::clone(&keyboard);
 
+    // With a streamed response, the text is typed as the model writes it
+    let live = (config.stream && !no_draw).then(|| {
+        Arc::new(Mutex::new(LiveTyping {
+            keyboard: Arc::clone(&keyboard),
+            typed: 0,
+        }))
+    });
+    let live_clone = live.clone();
+
     let tool_config_draw_text = load_config("tool_draw_text.json")?;
     engine.register_tool(
         "draw_text",
@@ -864,12 +914,27 @@ fn register_tools(
                 }
             }
             if !no_draw {
-                if let Err(e) = draw_text(text, &mut lock!(keyboard_clone)) {
+                // What is left of text that was typed as it arrived, or else all of it
+                let typed = match &live_clone {
+                    Some(live) => lock!(live).finish(text),
+                    None => draw_text(text, &mut lock!(keyboard_clone)),
+                };
+                if let Err(e) = typed {
                     log::error!("Failed to draw text: {}", e);
                 }
             }
         }),
     );
+    if let Some(live) = live {
+        engine.watch_tool_arguments(
+            "draw_text",
+            Box::new(move |arguments: Option<&str>| match arguments {
+                Some(arguments) => lock!(live).arguments_so_far(arguments),
+                // The response ended early: what was typed stays, and the next text starts afresh
+                None => lock!(live).typed = 0,
+            }),
+        );
+    }
 
     // Register draw_svg tool
     if !config.no_svg {
