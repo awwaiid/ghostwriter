@@ -16,6 +16,8 @@ pub enum ScreenshotMode {
         data: Vec<u8>,
         /// The same screenshot decoded, for reading individual pixels
         pixels: Option<RgbImage>,
+        /// Where the framebuffer was found last time, and in which process
+        framebuffer: Option<(String, u64)>,
         device_model: DeviceModel,
     },
     Simulated {
@@ -35,6 +37,7 @@ impl Screenshot {
             mode: ScreenshotMode::Real {
                 data: vec![],
                 pixels: None,
+                framebuffer: None,
                 device_model,
             },
         })
@@ -103,17 +106,7 @@ impl Screenshot {
             return Ok(());
         }
 
-        debug!("screenshot: finding pid");
-        let pid = Self::find_xochitl_pid()?;
-
-        debug!("screenshot: finding address");
-        let skip_bytes = self.find_framebuffer_address(&pid)?;
-
-        debug!("screenshot: reading data");
-        let framebuffer = self.read_framebuffer(&pid, skip_bytes)?;
-
-        debug!("screenshot: processing image");
-        let image = self.decode_framebuffer(framebuffer)?;
+        let image = self.capture_full_resolution()?;
         let (png, scaled) = Self::scale_and_encode(&image)?;
 
         if let ScreenshotMode::Real { data, pixels, .. } = &mut self.mode {
@@ -122,6 +115,39 @@ impl Screenshot {
         }
 
         Ok(())
+    }
+
+    /// Capture the screen at the device's own resolution, upright.
+    /// Finding the framebuffer is the slow part, so its address is kept for the next
+    /// capture by the same `Screenshot`.
+    pub fn capture_full_resolution(&mut self) -> Result<DynamicImage> {
+        debug!("screenshot: finding pid");
+        let pid = Self::find_xochitl_pid()?;
+
+        debug!("screenshot: finding address");
+        let known = match &self.mode {
+            ScreenshotMode::Real {
+                framebuffer: Some((known_pid, address)),
+                ..
+            } if *known_pid == pid => Some(*address),
+            _ => None,
+        };
+        let skip_bytes = match known {
+            Some(address) => address,
+            None => {
+                let address = self.find_framebuffer_address(&pid)?;
+                if let ScreenshotMode::Real { framebuffer, .. } = &mut self.mode {
+                    *framebuffer = Some((pid.clone(), address));
+                }
+                address
+            }
+        };
+
+        debug!("screenshot: reading data");
+        let framebuffer = self.read_framebuffer(&pid, skip_bytes)?;
+
+        debug!("screenshot: processing image");
+        self.decode_framebuffer(framebuffer)
     }
 
     fn find_xochitl_pid() -> Result<String> {

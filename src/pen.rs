@@ -7,7 +7,58 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crate::device::{DeviceModel, InputOrientation, VIRTUAL_HEIGHT, VIRTUAL_WIDTH};
-use crate::util::parse_svg;
+use crate::screenshot::Screenshot;
+use crate::stroke_plan::{missing_strokes, plan_strokes};
+use crate::util::{parse_svg, svg_to_alpha_bitmap};
+
+/// One continuous pen stroke.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stroke {
+    /// Where the pen goes, in virtual page coordinates. Fractions are kept: the
+    /// digitizer is several times finer than the virtual page.
+    pub points: Vec<(f32, f32)>,
+    /// Pen pressure. `FULL_PRESSURE` is a firm stroke.
+    pub pressure: i32,
+}
+
+/// How quickly strokes are sent to the device.
+#[derive(Debug, Clone, Copy)]
+pub struct StrokeTiming {
+    /// Pause after the pen touches down, before it moves.
+    pub after_down: Duration,
+    /// Pause after the pen lifts, before the next stroke.
+    pub after_up: Duration,
+    /// Pause after every `points_per_pause` points along a stroke.
+    pub pause: Duration,
+    pub points_per_pause: usize,
+}
+
+impl Default for StrokeTiming {
+    /// About 2000 strokes a second. A Paper Pro on firmware 3.29 kept up with 200
+    /// microseconds between strokes and began to lose them at 100.
+    fn default() -> Self {
+        Self {
+            after_down: Duration::ZERO,
+            after_up: Duration::from_micros(300),
+            pause: Duration::from_millis(1),
+            points_per_pause: 100,
+        }
+    }
+}
+
+impl StrokeTiming {
+    /// Slow enough that the device does not drop strokes: for drawing again the ones it did.
+    pub fn careful() -> Self {
+        Self {
+            after_down: Duration::from_millis(1),
+            after_up: Duration::from_millis(1),
+            ..Self::default()
+        }
+    }
+}
+
+/// The pressure of a firm stroke. (The digitizers report up to about 4096.)
+pub const FULL_PRESSURE: i32 = 2630;
 
 pub struct Pen {
     device: Option<Device>,
@@ -524,6 +575,92 @@ impl Pen {
         let polylines = svg2polylines::parse(svg_data, 0.5, true).map_err(|e| anyhow::anyhow!("svg2polylines error: {}", e))?;
         info!("draw_svg_paths_raw: {} polylines", polylines.len());
         self.draw_polylines(&polylines)
+    }
+
+    /// Draw an SVG on the page.
+    pub fn draw_svg(&mut self, svg_data: &str) -> Result<()> {
+        match self.device_model {
+            // Strokes planned for the Paper Pro's thin fineliner, the pen that has been
+            // measured: a page that took half a minute takes a couple of seconds
+            DeviceModel::RemarkablePaperPro => {
+                let strokes = plan_strokes(svg_data, self.device_model.page_size())?;
+                info!("Drawing {} strokes", strokes.len());
+                self.draw_strokes(&strokes, &StrokeTiming::default())?;
+                self.redraw_missing(strokes)
+            }
+            // Row by row, with pen pressure standing in for anti-aliasing
+            _ => {
+                let scale = 2;
+                let alpha_bitmap = svg_to_alpha_bitmap(svg_data, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
+                self.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)
+            }
+        }
+    }
+
+    /// Look at the page, and draw again any of `strokes` that left no ink.
+    ///
+    /// Strokes are sent about as fast as the device can take them. When it falls behind
+    /// for a moment it drops a handful, which shows as a gap through whatever was being
+    /// drawn. Trouble looking at the page is not an error: the drawing has been made.
+    fn redraw_missing(&mut self, strokes: Vec<Stroke>) -> Result<()> {
+        const ROUNDS: usize = 3;
+        // How long the device takes to put the last strokes on the page
+        const SETTLE: Duration = Duration::from_millis(300);
+
+        let mut screenshot = match Screenshot::new() {
+            Ok(screenshot) => screenshot,
+            Err(e) => {
+                info!("Not checking the drawing: {}", e);
+                return Ok(());
+            }
+        };
+
+        let mut missing = strokes;
+        for _ in 0..ROUNDS {
+            sleep(SETTLE);
+            let capture = match screenshot.capture_full_resolution() {
+                Ok(capture) => capture.to_luma8(),
+                Err(e) => {
+                    info!("Not checking the drawing: {}", e);
+                    return Ok(());
+                }
+            };
+            missing = missing_strokes(&missing, &capture);
+            if missing.is_empty() {
+                break;
+            }
+            info!("Drawing {} strokes again that did not arrive", missing.len());
+            self.draw_strokes(&missing, &StrokeTiming::careful())?;
+        }
+        Ok(())
+    }
+
+    /// Draw strokes planned in virtual page coordinates.
+    pub fn draw_strokes(&mut self, strokes: &[Stroke], timing: &StrokeTiming) -> Result<()> {
+        for stroke in strokes {
+            let Some(&first) = stroke.points.first() else {
+                continue;
+            };
+            self.goto_xy_with_pressure(self.virtual_point_to_input(first), stroke.pressure)?;
+            sleep(timing.after_down);
+
+            for (index, &point) in stroke.points.iter().enumerate().skip(1) {
+                self.goto_xy(self.virtual_point_to_input(point))?;
+                if timing.points_per_pause > 0 && index % timing.points_per_pause == 0 {
+                    sleep(timing.pause);
+                }
+            }
+
+            self.pen_up()?;
+            sleep(timing.after_up);
+        }
+        Ok(())
+    }
+
+    /// Convert a fractional virtual page coordinate to pen digitizer coordinates.
+    fn virtual_point_to_input(&self, (x, y): (f32, f32)) -> (i32, i32) {
+        let (x_input, y_input) = self.page_to_input(x / VIRTUAL_WIDTH as f32, y / VIRTUAL_HEIGHT as f32);
+        (x_input.round() as i32, y_input.round() as i32)
     }
 
     /// Convert a position on the page, as fractions of its width and height, to pen digitizer coordinates.

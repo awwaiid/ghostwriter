@@ -11,6 +11,7 @@ pub mod segmenter;
 pub mod simulation;
 pub mod skeleton;
 pub mod status;
+pub mod stroke_plan;
 pub mod touch;
 pub mod util;
 pub mod web_server;
