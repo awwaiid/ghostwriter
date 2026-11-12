@@ -22,6 +22,7 @@ Ghostwriter is a Vision-LLM agent for the reMarkable tablet that watches handwri
   - `screenshot.rs`: Screen capture by reading the framebuffer out of xochitl's memory
   - `pen.rs`: Drawing on the page with simulated pen strokes, paced by watching the screen for each stroke's ink
   - `stroke_plan.rs`: Turns an SVG into pen strokes for a pen whose strokes have been measured (`PenModel`)
+  - `partial.rs`: Picks out what can already be drawn from a tool call that is still arriving
   - `path_strokes.rs`: The part of that plan that follows slanting and curving lines along their length
   - `keyboard.rs`: Virtual keyboard input via uinput
   - `touch.rs`: Touch event detection, simulated taps, and pen tool selection through the palette
@@ -121,6 +122,7 @@ scp target/aarch64-unknown-linux-gnu/release/ghostwriter root@192.168.1.117:
 - xochitl draws about 2000 strokes a second. The kernel queues 1024 pen events for it; if it falls a queue-full behind, the whole queue is dropped and strokes are lost or run into each other. So `Pen::draw_strokes_watched` reads pixels out of the screen buffer to see which strokes have arrived, and never sends more than a few dozen ahead
 - The tool palette is read off the screen too (`Palette` in `touch.rs`), so taps are confirmed rather than timed. Its positions are in screen pixels for firmware 3.29
 - Each colour in an SVG is drawn in the nearest of the pen's inks (`stroke_plan::Ink`), one ink at a time with the pen's colour changed in between, and what is white or pale is left as bare paper. The model is told it can use colour (`embedded_assets::for_colour_display`) unless `--no-color` or `--no-select-pen` is given
+- With `--stream`, the Anthropic engine takes its response as server-sent events and tells the draw_svg tool of its arguments as they arrive (`LLMEngine::watch_tool_arguments`). `partial.rs` picks the complete SVG elements out of them, `stroke_plan::DrawingInParts` plans only what each batch adds, and `LiveDrawing` in `main.rs` draws it. This has been tried against a mock of the API, not the API itself
 - `device::FullSpeed` stops the kernel slowing the memory bus down while ghostwriter works, which otherwise makes screenshots and planning about four times slower
 - Other devices still draw row by row from a bitmap (`Pen::draw_bitmap_alpha_pressure`) and select the pen with timed taps: their pens have not been measured
 - `experiment draw-planned FILE.svg` draws the way ghostwriter does; `experiment score REFERENCE CAPTURE` puts a number on the result

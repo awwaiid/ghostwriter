@@ -1,5 +1,8 @@
-use super::{call_tool, no_tool_calls, notify, post_json, ExecuteFuture, LLMEngine, ModelExecutionStatus, StatusCallback, Tool, ToolCallback};
-use crate::cancellation::GhostwriterCancellation;
+use super::{
+    call_tool, no_tool_calls, notify, post_json, ExecuteFuture, LLMEngine, ModelExecutionStatus, PartialCallback, ServerSentEvents, StatusCallback, Tool,
+    ToolCallback,
+};
+use crate::cancellation::{with_cancellation, GhostwriterCancellation};
 use crate::util::{option_or_env, option_or_env_fallback, OptionMap};
 use anyhow::{Context, Result};
 use log::debug;
@@ -15,6 +18,17 @@ pub struct Anthropic {
     web_search: bool,
     thinking: bool,
     thinking_tokens: u32,
+    /// Take the response as a stream, so that a tool can be told of its arguments as they arrive
+    stream: bool,
+}
+
+/// A tool call as it arrives in a streamed response.
+struct StreamedToolCall {
+    name: String,
+    /// The text so far of the JSON object that its arguments will be
+    arguments: String,
+    /// Whether more of them has arrived since the tool was last told
+    grown: bool,
 }
 
 impl Anthropic {
@@ -59,6 +73,128 @@ impl Anthropic {
 
         body
     }
+
+    /// The request for a streamed response. The tools' arguments are asked for as they
+    /// are written rather than held back until each is complete and checked, which
+    /// means checking them here once they are.
+    fn streaming_request_body(&self) -> json {
+        let mut body = self.request_body();
+        body["stream"] = json!(true);
+        for tool in body["tools"].as_array_mut().into_iter().flatten() {
+            // Our own tools have a schema; the ones Anthropic runs do not take the setting
+            if tool.get("input_schema").is_some() {
+                tool["eager_input_streaming"] = json!(true);
+            }
+        }
+        body
+    }
+
+    /// Read a streamed response, telling tools of their arguments as they arrive.
+    /// Returns the name and arguments of the first tool the model called, if it called one.
+    async fn read_stream(
+        &mut self,
+        request: reqwest::RequestBuilder,
+        body: &json,
+        status_callback: &mut Option<StatusCallback>,
+    ) -> Result<Option<(String, json)>> {
+        let mut response = request.json(body).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            anyhow::bail!("API Error: {}: {}", status, response.text().await?.trim());
+        }
+
+        let mut events = ServerSentEvents::default();
+        // The tool calls in the response, by the place of each among its content blocks
+        let mut calls: Vec<(u64, StreamedToolCall)> = Vec::new();
+        let mut stop_reason = String::new();
+        let mut finished = false;
+        while let Some(piece) = response.chunk().await? {
+            for data in events.push(&piece) {
+                let Ok(event) = serde_json::from_str::<json>(&data) else {
+                    debug!("Skipping an event that is not JSON: {}", data);
+                    continue;
+                };
+                match event["type"].as_str().unwrap_or("") {
+                    "content_block_start" if event["content_block"]["type"] == "tool_use" => {
+                        if calls.is_empty() {
+                            notify(status_callback, ModelExecutionStatus::ProcessingResponse);
+                        }
+                        let call = StreamedToolCall {
+                            name: event["content_block"]["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: String::new(),
+                            grown: false,
+                        };
+                        calls.push((event["index"].as_u64().unwrap_or_default(), call));
+                    }
+                    "content_block_delta" if event["delta"]["type"] == "input_json_delta" => {
+                        if let Some((_, call)) = calls.iter_mut().find(|(index, _)| event["index"].as_u64() == Some(*index)) {
+                            call.arguments.push_str(event["delta"]["partial_json"].as_str().unwrap_or_default());
+                            call.grown = true;
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(reason) = event["delta"]["stop_reason"].as_str() {
+                            stop_reason = reason.to_string();
+                        }
+                    }
+                    "message_stop" => finished = true,
+                    "error" => anyhow::bail!("API Error: {}", event["error"]),
+                    _ => {}
+                }
+            }
+
+            // Once for each piece of the stream, however many events it held: a tool that
+            // takes its time over what it is told finds the next piece all the longer
+            if let Some((_, call)) = calls.first_mut().filter(|(_, call)| call.grown) {
+                call.grown = false;
+                if let Some(partial) = self.tools.iter_mut().find(|tool| tool.name == call.name).and_then(|tool| tool.partial.as_mut()) {
+                    partial(Some(&call.arguments));
+                }
+            }
+        }
+        debug!("The response stopped for the reason {:?}", stop_reason);
+        anyhow::ensure!(finished, "The response was cut off before it was complete");
+
+        let Some((_, call)) = calls.into_iter().next() else {
+            return Ok(None);
+        };
+        // Arguments streamed as they are written have not been checked: they may have
+        // been cut short, or not be JSON at all
+        anyhow::ensure!(
+            stop_reason != "max_tokens" && stop_reason != "refusal",
+            "The model's call to {} was cut short ({})",
+            call.name,
+            stop_reason
+        );
+        let arguments = if call.arguments.trim().is_empty() { "{}" } else { call.arguments.as_str() };
+        let arguments = serde_json::from_str(arguments).with_context(|| format!("The model's call to {} was not valid JSON", call.name))?;
+        Ok(Some((call.name, arguments)))
+    }
+
+    /// Send the content to the model, take its response as a stream, and run the tool it calls.
+    async fn execute_streaming(&mut self, cancellation: &GhostwriterCancellation, status_callback: &mut Option<StatusCallback>) -> Result<()> {
+        let body = self.streaming_request_body();
+        debug!("Request: {}", body);
+        notify(status_callback, ModelExecutionStatus::LlmProcessing);
+
+        let request = reqwest::Client::new()
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", self.api_key.as_str())
+            .header("anthropic-version", "2023-06-01");
+        let called = with_cancellation(self.read_stream(request, &body, status_callback), cancellation).await;
+
+        match called {
+            Ok(Some((name, arguments))) => call_tool(&mut self.tools, &name, arguments, status_callback),
+            ended_otherwise => {
+                // Whatever a tool began on the strength of its arguments so far, it is not going to be run
+                for partial in self.tools.iter_mut().filter_map(|tool| tool.partial.as_mut()) {
+                    partial(None);
+                }
+                ended_otherwise?;
+                Err(no_tool_calls(status_callback))
+            }
+        }
+    }
 }
 
 impl LLMEngine for Anthropic {
@@ -72,7 +208,14 @@ impl LLMEngine for Anthropic {
             web_search: options.get("web_search").is_some_and(|v| v == "true"),
             thinking: options.get("thinking").is_some_and(|v| v == "true"),
             thinking_tokens: options.get("thinking_tokens").and_then(|v| v.parse::<u32>().ok()).unwrap_or(5000),
+            stream: options.get("stream").is_some_and(|v| v == "true"),
         })
+    }
+
+    fn watch_tool_arguments(&mut self, name: &str, callback: PartialCallback) {
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.name == name) {
+            tool.partial = Some(callback);
+        }
     }
 
     fn register_tool(&mut self, name: &str, definition: json, callback: ToolCallback) {
@@ -80,6 +223,7 @@ impl LLMEngine for Anthropic {
             name: name.to_string(),
             definition,
             callback,
+            partial: None,
         });
     }
 
@@ -107,6 +251,10 @@ impl LLMEngine for Anthropic {
 
     fn execute<'a>(&'a mut self, cancellation: &'a GhostwriterCancellation, mut status_callback: Option<StatusCallback>) -> ExecuteFuture<'a> {
         Box::pin(async move {
+            if self.stream {
+                return self.execute_streaming(cancellation, &mut status_callback).await;
+            }
+
             let body = self.request_body();
             debug!("Request: {}", body);
 
@@ -174,6 +322,27 @@ mod tests {
             json!([{"name": "draw_text", "description": "Type text", "input_schema": {"type": "object"}}])
         );
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn a_streaming_request_asks_for_our_tools_arguments_as_they_are_written() {
+        let mut engine = engine(&[("stream", "true"), ("web_search", "true")]);
+        engine.register_tool(
+            "draw_svg",
+            json!({"name": "draw_svg", "description": "Draw", "parameters": {"type": "object"}}),
+            Box::new(|_| {}),
+        );
+
+        let body = engine.streaming_request_body();
+
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+        // The web search tool is run by Anthropic, and does not take the setting
+        assert_eq!(body["tools"][1]["name"], "web_search");
+        assert!(body["tools"][1].get("eager_input_streaming").is_none());
+        // And an ordinary request is as it was
+        assert!(engine.request_body().get("stream").is_none());
+        assert!(engine.request_body()["tools"][0].get("eager_input_streaming").is_none());
     }
 
     #[test]

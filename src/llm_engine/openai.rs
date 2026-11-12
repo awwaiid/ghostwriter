@@ -67,6 +67,7 @@ impl LLMEngine for OpenAI {
             name: name.to_string(),
             definition,
             callback,
+            partial: None,
         });
     }
 

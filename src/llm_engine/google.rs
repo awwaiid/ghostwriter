@@ -62,6 +62,7 @@ impl LLMEngine for Google {
             name: name.to_string(),
             definition,
             callback,
+            partial: None,
         });
     }
 

@@ -68,6 +68,8 @@ Draw some stuff on your screen, and then trigger the assistant by *touching/tapp
 * `--no-select-pen` - Draw with whichever pen is selected, without opening the palette. It should be the pen named by `--pen`; if the first stroke doesn't look like it, the pen is selected after all
 * `--no-color` - Don't tell the model that it can draw in colour. On a reMarkable Paper Pro it is otherwise told that it can use gray, blue, red, green, yellow, cyan and magenta as well as black, and each is drawn by changing the pen's colour. (With `--no-select-pen` everything is drawn in whatever colour the pen is.)
 
+* `--stream` - Take the model's response as it is written, and start drawing an SVG while the rest of it is still arriving, an element at a time. Anthropic models on a reMarkable Paper Pro only, and so far only tried against a stand-in for the API
+
 **Tools:**
 * `--no-svg` - Disable SVG drawing tool
 * `--no-keyboard` - Disable text output
