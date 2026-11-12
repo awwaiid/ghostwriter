@@ -219,6 +219,17 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         strokes: usize,
     },
+    /// Type some text with the virtual keyboard, waiting a given time after each key,
+    /// and report how long it took
+    TypeText {
+        text: String,
+        /// How many times over to type it
+        #[arg(long, default_value_t = 1)]
+        times: usize,
+        /// Microseconds to wait after each key
+        #[arg(long, default_value_t = 10000)]
+        key_delay_us: u64,
+    },
     /// Render where an SVG file puts ink, at the device's page size, to compare a capture with.
     /// Run on the device this uses the device's own fonts
     Render { svg_path: String, output_path: String },
@@ -969,6 +980,20 @@ async fn main() -> Result<()> {
                 touch.tap_palette_button().await?;
                 sleep(Duration::from_millis(700)).await;
             }
+        }
+
+        Commands::TypeText { text, times, key_delay_us } => {
+            ghostwriter::util::setup_uinput()?;
+            let mut keyboard = ghostwriter::keyboard::Keyboard::new(false, false)?;
+            // A keyboard that has only just appeared is not listened to straight away
+            sleep(Duration::from_millis(1500)).await;
+            keyboard.set_key_delay(Duration::from_micros(key_delay_us));
+            let started = std::time::Instant::now();
+            for _ in 0..times {
+                keyboard.string_to_keypresses(&text)?;
+            }
+            println!("typed {} characters in {} ms", text.chars().count() * times, started.elapsed().as_millis());
+            sleep(Duration::from_millis(300)).await;
         }
 
         Commands::Render { svg_path, output_path } => {
