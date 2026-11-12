@@ -78,7 +78,7 @@ class GhostwriterConfig {
         // Text inputs and selects
         const textFields = [
             'model', 'prompt', 'engine', 'engine_base_url', 'engine_api_key',
-            'trigger_corner', 'log_level', 'thinking_tokens',
+            'trigger_corner', 'pen', 'log_level', 'thinking_tokens',
             'input_png', 'output_file', 'model_output_file',
             'save_screenshot', 'save_bitmap'
         ];
@@ -92,7 +92,7 @@ class GhostwriterConfig {
 
         // Checkboxes
         const boolFields = [
-            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress',
+            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress', 'no_select_pen',
             'no_loop', 'no_trigger', 'apply_segmentation', 'web_search', 'thinking'
         ];
 
@@ -110,7 +110,7 @@ class GhostwriterConfig {
         // Text fields
         const textFields = [
             'model', 'prompt', 'engine', 'engine_base_url', 'engine_api_key',
-            'trigger_corner', 'log_level',
+            'trigger_corner', 'pen', 'log_level',
             'input_png', 'output_file', 'model_output_file',
             'save_screenshot', 'save_bitmap'
         ];
@@ -134,7 +134,7 @@ class GhostwriterConfig {
 
         // Boolean fields
         const boolFields = [
-            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress',
+            'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress', 'no_select_pen',
             'no_loop', 'no_trigger', 'apply_segmentation', 'web_search', 'thinking'
         ];
 

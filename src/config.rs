@@ -9,6 +9,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
 pub struct Config {
     // Direct mapping to CLI args - no arbitrary grouping
     pub engine: Option<String>,

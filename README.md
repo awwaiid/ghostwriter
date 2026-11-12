@@ -64,6 +64,8 @@ Draw some stuff on your screen, and then trigger the assistant by *touching/tapp
 **Behavior:**
 * `--prompt PROMPT` - Prompt file to use (default: general.json)
 * `--trigger-corner CORNER` - Touch trigger corner: UR, UL, LR, LL (default: UR)
+* `--pen PEN` - Pen to draw with: `fineliner` (the second pen in the palette, set to thin) or `ballpoint` (the first pen, set to medium) (default: fineliner). The pen is selected in the palette before drawing, and the tool and pen settings you had are put back afterwards
+* `--no-select-pen` - Draw with whichever pen is selected, without opening the palette. It should be the pen named by `--pen`; if the first stroke doesn't look like it, the pen is selected after all
 
 **Tools:**
 * `--no-svg` - Disable SVG drawing tool
