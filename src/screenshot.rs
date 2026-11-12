@@ -332,9 +332,13 @@ impl Screenshot {
 
         match self.device_model() {
             DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperPure => {
-                // 32-bit RGBA
-                debug!("Decoding {}x{} RGBA framebuffer", width, height);
-                Ok(RgbaImage::from_raw(width, height, raw_data).ok_or_else(invalid_size)?.into())
+                // 32-bit pixels, stored blue first
+                debug!("Decoding {}x{} BGRA framebuffer", width, height);
+                let mut pixels = raw_data;
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                Ok(RgbaImage::from_raw(width, height, pixels).ok_or_else(invalid_size)?.into())
             }
             DeviceModel::RemarkablePaperProMove => {
                 // 16 bits per pixel with the grey level in the low byte, already in portrait.
@@ -368,7 +372,9 @@ impl Screenshot {
     /// Scale an image to the virtual page size. Returns it as a PNG and as decoded pixels.
     fn scale_and_encode(image: &DynamicImage) -> Result<(Vec<u8>, RgbImage)> {
         debug!("Resizing image to {}x{}", VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
-        let scaled = image.resize_exact(VIRTUAL_WIDTH, VIRTUAL_HEIGHT, image::imageops::FilterType::Nearest);
+        // Averaging, not picking every other pixel: a pen line is only two pixels wide,
+        // and picking can miss it altogether
+        let scaled = image.thumbnail_exact(VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
 
         debug!("Encoding resized image");
         let mut png_data = Vec::new();
