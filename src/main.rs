@@ -15,7 +15,7 @@ use ghostwriter::{
     coordinator::{self, CoordinatorChannels, ProgressState},
     device::{DeviceModel, FullSpeed, VIRTUAL_HEIGHT, VIRTUAL_WIDTH},
     embedded_assets::{for_colour_display, load_config},
-    keyboard::Keyboard,
+    keyboard::{text_for_tablet_lists, text_for_tablet_lists_so_far, Keyboard},
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
     partial::{drawable_so_far, string_property_so_far},
     pen::{Drawing, DrawingPen, Pen},
@@ -273,7 +273,7 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     info!("Drawing text to the screen.");
     keyboard.progress_end()?;
     keyboard.key_cmd_body()?;
-    keyboard.string_to_keypresses(text)?;
+    keyboard.string_to_keypresses(&text_for_tablet_lists(text))?;
     Ok(())
 }
 
@@ -288,7 +288,7 @@ impl LiveTyping {
     /// More of the draw_text tool's arguments have arrived: type what is new of its text.
     fn arguments_so_far(&mut self, arguments: &str) {
         if let Some(text) = string_property_so_far(arguments, "text") {
-            if let Err(e) = self.type_up_to(&text) {
+            if let Err(e) = self.type_up_to(&text_for_tablet_lists_so_far(&text)) {
                 log::error!("Failed to type text: {}", e);
             }
         }
@@ -312,7 +312,7 @@ impl LiveTyping {
 
     /// All of the text has arrived: type the last of it, and be ready for the next.
     fn finish(&mut self, text: &str) -> Result<()> {
-        let typed = self.type_up_to(text);
+        let typed = self.type_up_to(&text_for_tablet_lists(text));
         self.typed = 0;
         typed
     }
