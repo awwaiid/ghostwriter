@@ -110,6 +110,113 @@ fn ascii_fallback(c: char) -> Option<&'static str> {
     })
 }
 
+/// The two kinds of list the tablet formats by itself while text is typed.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ListKind {
+    Numbered,
+    Bulleted,
+}
+
+/// The kind of list item a line is written as, and the line without its marker.
+///
+/// A dash or bullet character counts as "- " because that is what gets typed for it.
+fn list_item(line: &str) -> Option<(ListKind, &str)> {
+    const BULLETS: [&str; 6] = ["- ", "* ", "• ", "– ", "— ", "− "];
+    if let Some(rest) = BULLETS.iter().find_map(|bullet| line.strip_prefix(bullet)) {
+        return Some((ListKind::Bulleted, rest));
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = line[digits..].strip_prefix(". ")?;
+    (digits > 0).then_some((ListKind::Numbered, rest))
+}
+
+/// The list the tablet starts when this line is typed outside of a list.
+/// Bullets always start one; of the numbers, only "1. " does.
+fn list_started_by(line: &str) -> Option<ListKind> {
+    match list_item(line)? {
+        (ListKind::Numbered, _) if !line.starts_with("1. ") => None,
+        (kind, _) => Some(kind),
+    }
+}
+
+/// Rewrite `text` so that its lists come out right when typed on the tablet.
+///
+/// reMarkable formats lists as they are typed: a line that starts with "1. " becomes a
+/// numbered list and one that starts with "- " or "* " a bulleted list. Enter then goes on
+/// with the next number or bullet, and Enter on an empty item ends the list. A model
+/// writes every marker out itself, so typed as it is, each item after the first would get
+/// two ("2. 2. ...").
+///
+/// So only the first item keeps its marker, blank lines between items are left out (they
+/// would end the list), and a list is ended with an extra Enter when the text goes on
+/// with something that is not an item of it.
+pub fn text_for_tablet_lists(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut typed: Vec<&str> = Vec::new();
+    // The list the tablet is in once the lines so far have been typed
+    let mut open: Option<ListKind> = None;
+
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+
+        if let Some(kind) = open {
+            if let Some((_, rest)) = list_item(line).filter(|&(item_kind, _)| item_kind == kind) {
+                typed.push(rest);
+                index += 1;
+                continue;
+            }
+
+            if line.trim().is_empty() {
+                let Some(next) = lines[index..].iter().position(|line| !line.trim().is_empty()) else {
+                    // Only blank lines are left: typing them would add an empty item
+                    break;
+                };
+                if list_item(lines[index + next]).is_some_and(|(item_kind, _)| item_kind == kind) {
+                    // The list goes on after the gap
+                    index += next;
+                    continue;
+                }
+                // This blank line is the Enter that ends the list
+                typed.push("");
+                open = None;
+                index += 1;
+                continue;
+            }
+
+            // Something else follows straight away: end the list first
+            typed.push("");
+        }
+
+        open = list_started_by(line);
+        typed.push(line);
+        index += 1;
+    }
+
+    typed.join("\n")
+}
+
+/// As much of a text that is still arriving as can be typed already, with its lists
+/// rewritten as `text_for_tablet_lists` does.
+///
+/// What a line turns into depends on how it starts, so the last line is held back
+/// while it could still turn out to be a list item: while it is empty, or only the
+/// beginning of a marker. Each result starts with the one before it.
+pub fn text_for_tablet_lists_so_far(text: &str) -> String {
+    let last_line_start = text.rfind('\n').map_or(0, |newline| newline + 1);
+    let last_line = &text[last_line_start..];
+
+    let digits = last_line.bytes().take_while(u8::is_ascii_digit).count();
+    let could_be_a_number = digits > 0 && matches!(&last_line[digits..], "" | ".");
+    let could_be_a_bullet = matches!(last_line, "-" | "*" | "•" | "–" | "—" | "−");
+
+    if last_line.is_empty() || could_be_a_number || could_be_a_bullet {
+        text_for_tablet_lists(&text[..last_line_start])
+    } else {
+        text_for_tablet_lists(text)
+    }
+}
+
 pub struct Keyboard {
     device: Option<VirtualDevice>,
     /// The key for each character, and whether it needs shift
@@ -316,5 +423,74 @@ mod tests {
         assert_eq!(keyboard.keys_for("café… “ok” — 5×2"), keyboard.keys_for("cafe... \"ok\" - 5x2"));
         // A character with no fallback is skipped
         assert_eq!(keyboard.keys_for("a🙂b"), keyboard.keys_for("ab"));
+    }
+
+    #[test]
+    fn only_the_first_item_of_a_list_keeps_its_marker() {
+        // The tablet numbers and bullets the following items itself
+        assert_eq!(text_for_tablet_lists("1. a\n2. b\n3. c"), "1. a\nb\nc");
+        assert_eq!(text_for_tablet_lists("- a\n- b"), "- a\nb");
+        assert_eq!(text_for_tablet_lists("• a\n• b"), "• a\nb");
+        // Text without lists is typed as it is
+        assert_eq!(text_for_tablet_lists("one\n\ntwo 1. not a list"), "one\n\ntwo 1. not a list");
+    }
+
+    #[test]
+    fn a_list_is_ended_before_the_text_that_follows_it() {
+        // A blank line after the list is the Enter that ends it
+        assert_eq!(text_for_tablet_lists("Intro:\n1. a\n2. b\n\nOutro"), "Intro:\n1. a\nb\n\nOutro");
+        // Without one, that Enter is added
+        assert_eq!(text_for_tablet_lists("1. a\n2. b\nOutro"), "1. a\nb\n\nOutro");
+        // The same when another kind of list follows
+        assert_eq!(text_for_tablet_lists("- a\n1. b\n2. c"), "- a\n\n1. b\nc");
+        // Blank lines at the very end would leave an empty item behind
+        assert_eq!(text_for_tablet_lists("1. a\n2. b\n\n"), "1. a\nb");
+    }
+
+    #[test]
+    fn blank_lines_between_items_do_not_end_the_list() {
+        assert_eq!(text_for_tablet_lists("1. a\n\n2. b\n\n3. c\n\nOutro"), "1. a\nb\nc\n\nOutro");
+    }
+
+    #[test]
+    fn numbers_the_tablet_does_not_format_are_kept() {
+        // Only "1. " starts a numbered list on the tablet
+        assert_eq!(text_for_tablet_lists("3. a\n4. b"), "3. a\n4. b");
+        assert_eq!(text_for_tablet_lists("1) a\n2) b"), "1) a\n2) b");
+        // An indented line is not an item: it ends the list, and the next number stays
+        assert_eq!(text_for_tablet_lists("1. a\n   note\n2. b"), "1. a\n\n   note\n2. b");
+    }
+
+    #[test]
+    fn a_text_that_is_still_arriving_is_typed_in_step() {
+        // Plain text is not held back
+        assert_eq!(text_for_tablet_lists_so_far("Hello wor"), "Hello wor");
+        // The start of a line is, while it could still be a marker
+        assert_eq!(text_for_tablet_lists_so_far("1. a\n2"), "1. a");
+        assert_eq!(text_for_tablet_lists_so_far("1. a\n2."), "1. a");
+        assert_eq!(text_for_tablet_lists_so_far("1. a\n2. b"), "1. a\nb");
+        assert_eq!(text_for_tablet_lists_so_far("1. a\n20 "), "1. a\n\n20 ");
+
+        // However the text is cut, what can be typed only ever grows, up to the whole
+        let texts = [
+            "Intro:\n1. a\n2. b\n\nOutro",
+            "1. a\n\n2. b\n\n3. c\n\nOutro\n",
+            "- a\n- b\n1. c\n2. d\nEnd",
+            "20 apples\n1. a\n   note\n2. b",
+            "• один\n• два\n\n— и всё",
+            "plain text\n\nwith two paragraphs",
+        ];
+        for text in texts {
+            let mut typed = String::new();
+            for end in (0..=text.len()).filter(|&end| text.is_char_boundary(end)) {
+                let so_far = text_for_tablet_lists_so_far(&text[..end]);
+                assert!(so_far.starts_with(&typed), "{so_far:?} does not carry on from {typed:?}");
+                typed = so_far;
+            }
+            assert!(
+                text_for_tablet_lists(text).starts_with(&typed),
+                "{typed:?} is not the start of the whole of {text:?}"
+            );
+        }
     }
 }
